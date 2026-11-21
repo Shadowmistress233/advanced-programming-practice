@@ -65,19 +65,35 @@
 ## （十二）后台审核与违规处置（模块 12）
 
 ### 1、类与职责
-（覆盖 `AdminAuditController`、`ReportController`、`AdminDictController`、`AdminAuditService`、`ReportService`、`ReportMapper`、`ItemAuditDTO`、`ReportSubmitDTO`、`ReportHandleDTO`）
+`AdminAuditController` 接收待审查询及审核决定；`ReportController` 分别接收用户举报、管理员查询与处置请求；`AdminDictController` 校验字典类型和操作。`AdminAuditService` 管理物品状态转换，`ReportService` 按工单类型执行处罚或申诉复核，`ReportMapper` 负责工单新增、筛选和条件更新。`ItemAuditDTO` 携带物品 ID 列表、决定及原因，`ReportSubmitDTO` 携带举报对象、类型和说明，`ReportHandleDTO` 携带处理状态、动作及备注。经办人从 Session 取得，所有接口 ID 均为 Integer。
 
 ### 2、方法设计
-（对应 `GET /api/admin/items/pending`、`POST /api/admin/items/audit`、`POST /api/reports`、`GET /api/admin/reports`、`POST /api/admin/reports/{id}/handle`、`POST /api/admin/dicts/{dictType}`）
+| 接口 | 方法、参数与成功结果（由公共 Result 封装） |
+| --- | --- |
+| `GET /api/admin/items/pending` | listPending(campus, categoryId, page, pageSize)：按校区、分类筛选待审物品，返回 PageInfo<PendingItemVO>。 |
+| `POST /api/admin/items/audit` | audit(itemIds, pass, reason)：审核一个或多个物品，返回 processedCount。 |
+| `POST /api/reports` | submit(itemId, reportType, reportContent)：按登录用户创建普通举报，返回 reportId、handleStatus。 |
+| `GET /api/admin/reports` | listReports(handleStatus, reportType, page, pageSize)：按状态和工单类型筛选，返回 PageInfo<ReportVO>。 |
+| `POST /api/admin/reports/{id}/handle` | handle(id, handleStatus, action, remark)：处理一个待办工单，返回 reportId、handleStatus。 |
+| `POST /api/admin/dicts/{dictType}` | maintain(dictType, op, payload)：对白名单内字典执行对应操作，返回操作结果或列表。 |
 
 ### 3、处理流程
-（批量审物品通过置在售+触发发布加分/驳回必选原因置下架；`report` 队列区分违规举报处置与积分申诉复核；字典维护与删除引用校验）
+1. 物品审核。校验 itemIds 非空并去重，驳回时校验原因。按 ID 升序在同一事务内把待审物品更新为在售（1）或已下架（4）；任一记录已离开待审状态则整批回滚。通过时逐件调用模块 07 记发布积分；驳回时向发布者说明原因。提交成功后通过模块 10 通知发布者。
+2. 工单分流。普通举报按允许的违规类型校验，reporter_id 取会话用户，说明不超过 500 字，初始 handle_status=0。积分申诉由模块 07 的专用入口建单，report_type 为“积分申诉”，report_content 关联原 credit_log.id 与理由；普通举报入口拒绝该保留类型。
+3. 管理员处置。在事务中读取工单，按 id 和 handle_status=0 条件写入目标状态、handle_user、handle_time。影响一行才执行对应动作：违规核实可下架物品、扣 15 分、限制发布或停用账号；根据已核实的对象执行，无法确定被处置账号时不得处罚。申诉通过时核对原扣分流水与申请人，通过模块 07 追加对应回补流水，保留原流水。驳回只记录结果。处置成功为 1，驳回为 2；动作失败则工单状态与业务变更一并回滚。事务提交后通知申请人。
+4. 字典维护。分类、成色、自提点、积分规则分别校验操作和字段。删除分类前在事务内检查其物品及子分类引用；若存在引用，保留原记录并返回冲突。对分类的引用写入与删除使用一致的锁定顺序，避免检查后又新增引用。
 
 ### 4、关键规则
-（仅 `admin` 角色可访问、不可重复审核/处置非待处理记录、停用账号即时生效、全操作加 `@OperLog` 留痕）
+五个 /api/admin/ 接口限 admin，普通举报接口要求有效登录。停用账号在处置事务中写入 user.status=0；此后即使用户持有旧 Session，AuthInterceptor 也会在下一次受保护请求进入控制器前复核状态并销毁会话。所有操作经模块 14 的 `@OperLog` 留痕，记录经办人、目标、动作及结果。两名管理员同时处理同一工单时仅允许一次状态转换和一次处罚或回补。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1002`/`1003`/`1005`/`2102` 及提示语）
+| 错误码与提示 | 触发条件及结果 |
+| --- | --- |
+| 1001 参数错误 | 拒绝空审核列表、缺少驳回原因、非法字典类型或与工单不符的处置动作，数据保持原状。 |
+| 1002 未登录 | Session 缺失或过期，提示重新登录。 |
+| 1003 无权限 | 非管理员访问后台队列或提交后台操作，拦截请求。 |
+| 1005 账号已停用 | 账号已停用但旧会话仍发起受保护请求，销毁会话并终止处理。 |
+| 2102 状态冲突 | 物品已审核、工单已处置或待删除分类仍被引用；提示刷新记录或先解除引用，重复请求不再记分。 |
 
 ## （十三）个人中心与信用档案（模块 13）
 

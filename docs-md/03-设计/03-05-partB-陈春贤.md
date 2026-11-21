@@ -16,87 +16,585 @@
 ## （三）双模式流转（模块 03）
 
 ### 1、类与职责
-（覆盖 `OrderController`、`OrderService`、`OrderServiceImpl`、`ExchangeOrderMapper`、`OrderCreateDTO`、`OrderCancelDTO`、`OrderVO`、`OrderDetailVO`）
+
+| 类 / 接口 | 所在包 | 职责 |
+| --- | --- | --- |
+| `OrderController` | `controller` | 暴露 5 个流转接口；`@Valid` 校验、取 Session `LoginUser`、封装 `Result<T>`，不含业务分支 |
+| `OrderService` | `service` | 定义锁单、接单、取消、分页与详情契约 |
+| `OrderServiceImpl` | `service.impl` | 事务边界所在：成对条件更新锁单、状态迁移校验、成对解锁；仅编排，SQL 全部下沉 Mapper |
+| `ExchangeOrderMapper` | `mapper` | 单据插入、按状态条件更新、双角色分页、详情联表查询 |
+| `ItemMapper` | `mapper` | 物品 `status=1 -> 2` 锁定与 `2 -> 1` 解锁的条件更新、在售态校验、按 ID 批量取摘要 |
+| `OrderCreateDTO` | `dto` | `itemId`、`tradeMode`、`offerItemId`、`message`（≤ 200 字）；用 `@NotNull`/`@Pattern`/`@Size` 卡住格式，`offerItemId` 的条件必填在 Service 内按 `tradeMode` 判定 |
+| `OrderCancelDTO` | `dto` | `id`、`closeReason`（`@NotBlank`、≤ 255 字） |
+| `OrderVo` / `OrderDetailVO` | `vo` | 列表项（单号、对方昵称、物品摘要、状态、时间）与详情（双方物品、状态步骤、可执行动作）；均不含 `verify_code` |
+| `OrderStatusEnum` | `enums` | 状态码与中文名、合法迁移表 `canTransit(from, to)`，禁止业务代码散落 `if (status == 1)` |
+| `IdUtil` | `util` | `nextOrderNo()` 生成 `CL` + `yyyyMMdd` + 4 位当日序号（如 `CL202611210054`），与 `uk_order_no` 共同兜底幂等 |
 
 ### 2、方法设计
-（对应 `POST /api/orders`、`POST /api/orders/{id}/confirm`、`POST /api/orders/{id}/cancel`、`GET /api/orders/mine`、`GET /api/orders/{id}`）
+
+| 方法签名 | 对应接口 | 事务 |
+| --- | --- | --- |
+| `OrderCreateResultVO create(OrderCreateDTO dto, LoginUser current)` | `POST /api/orders` | 是 |
+| `OrderStatusVO confirm(Integer orderId, LoginUser current)` | `POST /api/orders/{id}/confirm` | 是 |
+| `OrderCancelResultVO cancel(OrderCancelDTO dto, LoginUser current)` | `POST /api/orders/{id}/cancel` | 是 |
+| `PageResult<OrderVO> pageMine(OrderQuery query, LoginUser current)` | `GET /api/orders/mine` | 否（只读） |
+| `OrderDetailVO detail(Integer orderId, LoginUser current)` | `GET /api/orders/{id}` | 否（只读） |
+| `int closeTimeoutOrders(LocalDateTime now)` | 由模块 05 定时任务调用 | 是按单循环（见模块 05） |
+
+```java
+public interface OrderService {
+
+    /** 发起流转单：交换模式成对锁单，寄售模式仅锁目标物品 */
+    OrderCreateResultVO create(OrderCreateDTO dto, LoginUser current);
+
+    /** 物品所有者确认接单：0 -> 1 */
+    OrderStatusVO confirm(Integer orderId, LoginUser current);
+
+    /** 双方取消：0/1/2 -> 4，成对解锁物品 */
+    OrderCancelResultVO cancel(OrderCancelDTO dto, LoginUser current);
+
+    /** 我的流转：按 roleType（from/to）与状态分页 */
+    PageResult<OrderVO> pageMine(OrderQuery query, LoginUser current);
+
+    /** 详情：仅参与双方可见 */
+    OrderDetailVO detail(Integer orderId, LoginUser current);
+}
+```
 
 ### 3、处理流程
-（按序编号，标明 `@Transactional` 边界、条件更新 `status=1 -> 2` 成对锁单与取消成对解锁）
+
+**（1）发起流转单 `create`**（`@Transactional(rollbackFor = Exception.class)`）
+
+1、`@Valid` 校验入参格式，失败抛 `BizException(1001)`。
+
+2、按 `itemId` 查目标物品：不存在、`is_deleted = 1` 或 `status != 1` 一律抛 `2102`（不区分“不存在”与“不可操作”，避免探测他人下架物品）。
+
+3、`item.owner_id == current.getUserId()` 时抛 `2102`（禁止向本人下单）。
+
+4、校验 `dto.tradeMode` 与 `item.trade_mode` 一致，不一致抛 `2102`（前端传递错误模式不得顺手改写物品属性）。
+
+5、交换模式（`exchange`）：`offerItemId` 为空抛 `1001`；按 ID 查出换出物品，要求 `owner_id` 为当前用户、`status = 1`、`is_deleted = 0`、且 `id != itemId`，任一不满足抛 `2102`。
+
+6、**成对锁定（事务内，先目标后换出，固定顺序避免死锁）**：
+
+```java
+// 目标物品：在售 -> 锁定
+int locked = itemMapper.lockItem(itemId);          // UPDATE item SET status=2 WHERE id=? AND status=1 AND is_deleted=0
+if (locked != 1) {
+    throw new BizException(ErrorCode.ITEM_TAKEN);  // 2101 被抢先
+}
+// 交换模式再锁换出物品，失败则整个事务回滚，目标物品锁定一并撤销
+if (isExchange) {
+    int lockedOffer = itemMapper.lockItem(offerItemId);
+    if (lockedOffer != 1) {
+        throw new BizException(ErrorCode.ITEM_TAKEN); // 2101
+    }
+}
+```
+
+7、生成单号并插入单据：`order_status = 0`、`from_user_id = 当前用户`、`to_user_id = item.owner_id`、`verify_code` 留空（预约时才生成）。
+
+8、事务提交后，经 `@TransactionalEventListener(phase = AFTER_COMMIT)` 异步向物品所有者写一条 `notify`（`notify_type = order`）；通知失败仅记 `warn`，不回滚锁单。
+
+9、返回 `orderId`、`orderNo`、`orderStatus = 0`、`lockedItems`（目标 + 换出物品 ID 列表）。
+
+**（2）确认接单 `confirm`**
+
+1、查单据，不存在或当前用户既非 `from_user_id` 也非 `to_user_id` → `1003`；既非所有者又调用确认 → `1003`（仅 `to_user_id` 可确认）。
+
+2、`OrderStatusEnum.canTransit(0, 1)` 为假 → `2102`（已确认、已取消、已违约均在此拦截，避免重复确认）。
+
+3、条件更新 `UPDATE exchange_order SET order_status = 1 WHERE id = ? AND order_status = 0`，影响行数不等于 1 → `2102`。
+
+4、事务提交后通知发起方“对方已接单，请预约面交”。
+
+**（3）取消流转 `cancel`**
+
+1、查单据并校验参与方 → `1003`。
+
+2、仅 `0`（待确认）、`1`（已确认）、`2`（待面交）可取消，其余状态（`3`/`4`/`5`）→ `2102`。
+
+3、条件更新 `UPDATE exchange_order SET order_status = 4, close_reason = ? WHERE id = ? AND order_status = ?`（带原状态），影响行数不等于 1 → `2102`。
+
+4、**成对解锁**：目标物品 `2 -> 1`；交换模式下换出物品同样 `2 -> 1`。解锁用条件更新 `WHERE status = 2`，影响行数为 0 时记 `warn` 但不抛异常（物品可能已被后台下架，不应阻断取消）。
+
+5、事务提交后通知对方并附取消原因。
+
+**（4）我的流转 `pageMine` / 详情 `detail`**
+
+1、`pageMine` 按 `roleType` 决定过滤列：`from` 用 `from_user_id = ?`，`to` 用 `to_user_id = ?`；`PageHelper.startPage` 紧跟单条查询。
+
+2、`detail` 仅参与双方可读，非参与方 → `1003`；出参不含 `verify_code`（核销码只经二维码通道下发，见模块 05）。
 
 ### 4、关键规则
-（双模式状态机、防重复抢单条件更新、禁止向本人下单、三段超时统一归口到解锁入口）
+
+1、**双模式状态机**（越级一律 `2102`）：
+
+| 当前 | 允许迁移 | 触发者 | 说明 |
+| --- | --- | --- | --- |
+| `0` 待确认 | `1` 已确认 / `4` 已取消 | 所有者 / 双方或超时 | 24 小时未接单由定时任务置 `4` |
+| `1` 已确认 | `2` 待面交 / `4` 已取消 | 双方预约 / 双方或超时 | 48 小时未预约由定时任务置 `4` |
+| `2` 待面交 | `3` 已完成 / `4` 已取消 / `5` 已违约 | 发起方核销 / 双方 / 超时 | 超预约 24 小时由定时任务置 `5` |
+| `3` 已完成 | — | — | 终态，仅可评价 |
+| `4` 已取消 | — | — | 终态，物品已解锁 |
+| `5` 已违约 | — | — | 终态，物品已解锁，扣发起方积分 |
+
+2、**防重复抢单**：锁单一律用 `WHERE status = 1` 的条件更新 + 影响行数判定，禁止“先 `select` 判断再 `update`”——两人同时下单时后者必然读到过期快照。`lockedItems` 放在同一事务，任一失败整体回滚，不会出现“目标锁了、换出没锁”的半锁状态。
+
+3、**固定加锁顺序**：始终先锁目标物品、后锁换出物品，使两个互相交换的请求（A 换 B、B 换 A）按同一顺序竞争，避免死锁。
+
+4、**禁止向本人下单**：`owner_id == 当前用户` 直接 `2102`，与“物品被锁定”共用同一错误提示，不暴露物品所有权细节。
+
+5、**锁定态物品不可编辑、不可删除**：`item.status = 2` 时发布/编辑/下架接口一律 `2102`（该约束由模块 02 执行，本模块只负责置锁与解锁）。
+
+6、**单号幂等兜底**：`order_no` 撞 `uk_order_no` 时由 `GlobalExceptionHandler` 捕获 `DuplicateKeyException` 返回 `2102`，不重试生成新号（防止重复提交产生两张单据）。
+
+7、**通知不参与事务**：通知属可丢消息，一律 `AFTER_COMMIT` 异步发送；若与主事务同生共死，通知服务抖动会让锁单失败，得不偿失。
+
+8、**取消原因必填**：`close_reason` 为空直接 `1001`，保证详情页与后台审计能看到取消理由。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1002`/`1003`/`1005`/`2101`/`2102` 及提示语）
+
+| 错误码 | 触发场景 | 提示语 |
+| --- | --- | --- |
+| `1001` | `itemId`/`tradeMode` 缺失、`closeReason` 为空、`message` 超 200 字、交换模式缺 `offerItemId` | 请完善必填信息 / 取消原因不能为空 |
+| `1002` | Session 缺失或过期 | 请先登录 |
+| `1003` | 非流转单参与方查看详情、非所有者调用确认 | 无权操作该流转单 |
+| `1005` | 请求过程中账号被管理员停用 | 账号已停用，请联系管理员 |
+| `2101` | 目标或换出物品的条件更新影响行数为 0（被他人抢先锁单） | 手慢了，该物品已被抢先锁定 |
+| `2102` | 向本人下单、模式不一致、状态越级或重复确认、取消终态单据、操作锁定物品、单号冲突 | 当前状态不允许该操作 |
 
 ## （四）技能交换板块（模块 04）
 
 ### 1、类与职责
-（覆盖 `SkillController`、`SkillService`、`SkillServiceImpl`、`SkillMapper`、`SkillSaveDTO`、`SkillInviteDTO`、`SkillVO`、`SkillDetailVO`）
+
+| 类 / 接口 | 所在包 | 职责 |
+| --- | --- | --- |
+| `SkillController` | `controller` | 暴露 4 个技能接口，参数校验与 `Result` 封装 |
+| `SkillService` / `SkillServiceImpl` | `service` | 发布与关闭、筛选分页、详情互补计算、邀约受理 |
+| `SkillMapper` | `mapper` | 按用户统计有效条数、条件分页、按 ID 联表取详情 |
+| `SkillSaveDTO` | `dto` | `skillId`（空为新增）、`skillName`、`skillType`、`level`、`expectSkill`、`description`、`status` |
+| `SkillInviteDTO` | `dto` | `id`（路径）、`message`（≤ 200 字） |
+| `SkillQuery` | `dto` | `keyword`、`skillType`、`level`、`page`、`pageSize`（继承 `PageQuery`） |
+| `SkillVO` / `SkillDetailVO` | `vo` | 列表项（名称、类型、熟练度、发布人昵称与信用分）与详情（含 `complementary` 标识与匹配依据） |
+| `NotifyService` | `service`（模块 10 提供） | 邀约成功后写入站内通知，本模块只单向调用 |
 
 ### 2、方法设计
-（对应 `POST /api/skills`、`GET /api/skills`、`GET /api/skills/{id}`、`POST /api/skills/{id}/invites`）
+
+| 方法签名 | 对应接口 | 事务 |
+| --- | --- | --- |
+| `SkillStatusVO save(SkillSaveDTO dto, LoginUser current)` | `POST /api/skills`（发布/编辑/关闭三合一） | 是 |
+| `PageResult<SkillVO> page(SkillQuery query)` | `GET /api/skills` | 否 |
+| `SkillDetailVO detail(Integer id, LoginUser current)` | `GET /api/skills/{id}` | 否 |
+| `InviteResultVO invite(Integer id, SkillInviteDTO dto, LoginUser current)` | `POST /api/skills/{id}/invites` | 是（含通知） |
+
+```java
+public interface SkillService {
+
+    /** 发布 / 编辑 / 关闭：skillId 为空即新增，status=0 即关闭 */
+    SkillStatusVO save(SkillSaveDTO dto, LoginUser current);
+
+    /** 技能大厅：按名称、类型、熟练度筛选分页（公开） */
+    PageResult<SkillVO> page(SkillQuery query);
+
+    /** 详情：登录用户可见，含与当前用户的双向互补判定 */
+    SkillDetailVO detail(Integer id, LoginUser current);
+
+    /** 互换邀约：不可邀约本人、不可邀约已关闭技能，成功写站内通知 */
+    InviteResultVO invite(Integer id, SkillInviteDTO dto, LoginUser current);
+}
+```
 
 ### 3、处理流程
-（发布/编辑/关闭、筛选分页、双向互补匹配计算、邀约写通知）
+
+**（1）发布 / 编辑 `save`**
+
+1、`skillId` 为空走新增：`@Valid` 校验 `skillName`（≤ 50 字）、`skillType ∈ {1,2}`、`level ∈ {入门, 熟练, 精通}`，非法 → `1001`。
+
+2、新增前统计该用户同 `skill_type` 且 `status = 1` 的有效条数：`SELECT COUNT(*) FROM skill WHERE user_id = ? AND skill_type = ? AND status = 1`，`>= 3` 抛 `2201`。
+
+3、插入记录，`status` 默认 `1`，返回 `skillId`、`status`。
+
+4、`skillId` 非空走编辑：先按 ID 查记录，不存在或 `user_id != 当前用户` → `1003`；仅允许修改 `skillName`、`level`、`expectSkill`、`description`，`skill_type` 发布后不可改（否则可绕过 3 条上限）。
+
+5、`status = 0` 即关闭：条件更新 `WHERE id = ? AND user_id = ?`，关闭后不再出现在大厅列表，已发出的邀约仍可在消息记录中查看。
+
+**（2）筛选分页 `page`**
+
+1、`PageHelper.startPage(page, pageSize)`，`pageSize` 由 `PageQuery` 强制裁剪至 ≤ 50。
+
+2、固定过滤 `status = 1`，按 `skillType`、`level` 等值过滤；`keyword` 对 `skill_name` 与 `expect_skill` 做 `LIKE`，入参先经 `SensitiveWordUtil` 与 `%`/`_` 转义。
+
+3、排序固定 `create_time DESC`，不暴露排序字段（大厅无“最热”需求，避免多一种白名单）。
+
+**（3）详情与互补判定 `detail`**
+
+1、按 ID 查详情，不存在或 `status = 0` → `2102`（已关闭技能不可查看详情，避免邀约入口残留）。
+
+2、读取当前用户与发布者各自“我能提供（1）”与“我需要（2）”的技能名集合。
+
+3、双向匹配：当前用户的“我需要”集合与发布者“我能提供”集合有交集 **且** 当前用户“我能提供”与发布者“我需要”有交集 → 标记 `complementary = true`，并在 `matchTags` 返回交集技能名，作为页面“高度互补”角标依据。
+
+4、出参附发布人信用分与等级，便于判断是否值得交换。
+
+**（4）互换邀约 `invite`**
+
+1、查技能，不存在或 `status = 0` → `2102`。
+
+2、`skill.user_id == 当前用户` → `2202`（不可邀约本人）。
+
+3、事务内写入邀约记录（本模块只需 `notify` 一条站内通知即可承载，不单独建表；通知内容含技能名、邀约人与留言）。
+
+4、`message` 超 200 字 → `1001`；为空则使用默认文案“对你的技能「XXX」很感兴趣，想和你互换”。
+
+5、返回 `inviteSent = true`；通知写入失败抛 `5001` 并回滚（邀约必须送达才有意义，与订单通知的“可丢”策略相反）。
 
 ### 4、关键规则
-（同类有效技能 ≤ 3 条、不可邀约本人、已关闭技能禁邀约）
+
+1、**同类有效技能上限 3 条**：按 `user_id + skill_type + status = 1` 计数，编辑不增计数、关闭后释放名额；超限 `2201`。该规则落在 Service 而非数据库约束，因为“有效”是业务状态而非唯一性。
+
+2、**`skill_type` 发布后不可改**：允许改类型等于绕过上限（先发 3 条“我能提供”，再改成“我需要”）。
+
+3、**不可邀约本人**：`2202`，与“已关闭技能”共用同一入口校验顺序（先查存在与状态，再判本人），避免信息泄露。
+
+4、**已关闭技能不可见、不可邀约**：详情与邀约统一返回 `2102`，列表侧直接过滤，防止前端缓存旧链接绕过。
+
+5、**互补判定只做名称交集**：不做语义相似度计算，保证可解释——页面显示的具体技能名就是判定依据，避免“黑箱推荐”难以验收。
+
+6、**邀约通知必须入库**：与订单通知不同，邀约的唯一产出就是通知，所以通知写失败即整体失败（`5001`），不允许“邀约成功但对方收不到”。
+
+7、**技能不占用物品锁**：技能交换只做撮合与通知，不生成 `exchange_order`，因此不参与物品锁定状态机，避免与流转模块耦合。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1002`/`1005`/`2102`/`2201`/`2202` 及提示语）
+
+| 错误码 | 触发场景 | 提示语 |
+| --- | --- | --- |
+| `1001` | 技能名缺失或超长、`skillType`/`level` 取值非法、留言超 200 字 | 请检查填写内容 |
+| `1002` | 未登录访问详情或邀约 | 请先登录 |
+| `1005` | 账号已停用 | 账号已停用，请联系管理员 |
+| `2102` | 技能不存在、已关闭、编辑他人技能 | 该技能已关闭或不存在 |
+| `2201` | 同类有效技能已达 3 条 | 同类技能最多发布 3 条，请先关闭不再需要的技能 |
+| `2202` | 邀约自己发布的技能 | 不能邀约自己 |
 
 ## （五）预约面交与扫码核销（模块 05）
 
 ### 1、类与职责
-（覆盖预约与核销接口、`OrderTimeoutTask`、`OrderAppointDTO`、`OrderVerifyDTO`）
+
+| 类 / 接口 | 所在包 | 职责 |
+| --- | --- | --- |
+| `OrderController`（扩展） | `controller` | 新增预约、核销、二维码 3 个入口（与模块 03 共用控制器，避免 `/api/orders` 被两个控制器瓜分） |
+| `AppointmentService` / `AppointmentServiceImpl` | `service` | 预约排期校验、`verify_code` 生成与发放、核销幂等、超时归口 |
+| `OrderTimeoutTask` | `task` | 每小时巡检三段超时，逐单幂等处理 |
+| `OrderAppointDTO` | `dto` | `appointTime`（`@Future`、30 分钟粒度）、`appointPlace`（自提点白名单） |
+| `OrderVerifyDTO` | `dto` | `verifyCode`（`@NotBlank`、长度与字符集校验） |
+| `ExchangeOrderMapper`（扩展） | `mapper` | `2 -> 3` 核销条件更新、`2 -> 5` 违约条件更新、超时扫描查询 |
+| `QrCodeUtil` | `util` | `generatePng(content, size)` 生成二维码 PNG 流（ZXing） |
+| `IdUtil`（扩展） | `util` | `nextVerifyCode()` 生成 32 位一次性核销码（UUID 去横线） |
 
 ### 2、方法设计
-（对应 `POST /api/orders/{id}/appointment`、`POST /api/orders/{id}/verify`、`GET /api/orders/{id}/qrcode` 及每小时超时定时任务）
+
+| 方法签名 | 对应接口 | 事务 |
+| --- | --- | --- |
+| `OrderAppointVO appoint(OrderAppointDTO dto, Integer orderId, LoginUser current)` | `POST /api/orders/{id}/appointment` | 是 |
+| `OrderVerifyVO verify(Integer orderId, OrderVerifyDTO dto, LoginUser current)` | `POST /api/orders/{id}/verify` | 是 |
+| `byte[] qrcode(Integer orderId, LoginUser current)` | `GET /api/orders/{id}/qrcode` | 否（只读） |
+| `int scanTimeout(LocalDateTime now)` | 由 `OrderTimeoutTask` 每小时调用 | 逐单独立事务 |
+
+```java
+public interface AppointmentService {
+
+    /** 预约面交：1 -> 2，生成一次性核销码但不回传 */
+    OrderAppointVO appoint(OrderAppointDTO dto, Integer orderId, LoginUser current);
+
+    /** 发起方核销：2 -> 3，条件更新保证幂等，同事务内加分 */
+    OrderVerifyVO verify(Integer orderId, OrderVerifyDTO dto, LoginUser current);
+
+    /** 所有者取核销二维码：仅返回图片流，不返回明码 */
+    byte[] qrcode(Integer orderId, LoginUser current);
+
+    /** 三段超时巡检：0->4（24h）、1->4（48h）、2->5（超预约 24h） */
+    int scanTimeout(LocalDateTime now);
+}
+```
 
 ### 3、处理流程
-（按序编号：预约生成 `verify_code` 不回传 → 所有者取码 → 发起方扫码条件更新 `order_status=2 -> 3` → 单向调用模块 07 加分与模块 10 发评价提醒；定时任务三段超时扫描）
+
+**（1）预约 `appoint`**（`@Transactional`）
+
+1、查单据并校验参与方（仅 `from_user_id` / `to_user_id`）→ `1003`。
+
+2、单据必须为 `1` 已确认状态，否则：`0` 未接单 → `2102`（提示“等待对方接单”）、`2/3` → `2102`（已预约/已完成）、`4/5` → `2104`。
+
+3、校验预约时间：`appointTime` 必须晚于当前时间且落在 **09:00–21:00** 区间、分钟数为 `00` 或 `30`；不满足 → `1001`。
+
+4、校验 `appointPlace` 属于 `campus-loop.pickup-points` 配置白名单，否则 → `1001`（不落库任意字符串，避免统计口径被污染）。
+
+5、生成一次性核销码 `verify_code = IdUtil.nextVerifyCode()`（32 位，不可猜测）。
+
+6、条件更新 `UPDATE exchange_order SET order_status = 2, appoint_time = ?, appoint_place = ?, verify_code = ? WHERE id = ? AND order_status = 1`，影响行数不等于 1 → `2102`（并发重复预约）。
+
+7、**响应不返回 `verify_code`**：出参仅 `orderId`、`orderStatus`、`appointTime`、`appointPlace`。核销码只进二维码，确保“看到码的人不能核销、能核销的人拿不到码”。
+
+8、事务提交后通知对方预约时间与地点。
+
+**（2）获取二维码 `qrcode`**
+
+1、查单据，校验当前用户为 `to_user_id`（物品所有者），否则 → `1003`（发起方取码即自核销，必须拦死）。
+
+2、单据必须为 `2` 待面交且 `verify_code` 非空，否则 → `2102`。
+
+3、`QrCodeUtil.generatePng("CL-VERIFY:" + verify_code, 300)` 生成 PNG，`Content-Type: image/png` 直接写响应流，禁走 JSON。
+
+**（3）核销 `verify`**（`@Transactional`）
+
+1、查单据，校验当前用户为 `from_user_id`，否则 → `1003`（所有者核销即自核销）。
+
+2、状态判定：`3` 已完成 → `2102`（重复核销，且**不得重复加分**）；`5` 已违约 → `2104`；`0/1` → `2102`（未预约）。
+
+3、核销码校验：`dto.verifyCode` 与库中 `verify_code` 做**常量时间比较**，不一致 → `2103`。
+
+4、条件更新：`UPDATE exchange_order SET order_status = 3, finish_time = NOW() WHERE id = ? AND order_status = 2`，影响行数不等于 1 → `2102`。**这是幂等的唯一闸口**，并发两个核销请求只有一个能拿到 1。
+
+5、同事务内更新物品：目标物品 `2 -> 3` 已完成；交换模式下换出物品同样 `2 -> 3`。
+
+6、同事务内调用模块 07 `CreditService.addScore(fromUserId, +5, "finish", orderId)` 与 `CreditService.addScore(toUserId, +5, "finish", orderId)`：写 `credit_log` 并原子更新 `user.credit_score`。**同一数据库本地事务**，保证“核销成功但没加分”不会发生。
+
+7、事务提交后（`AFTER_COMMIT`）通知双方“已核销，请在 7 天内互评”，并写入模块 10 评价提醒。
+
+8、返回 `orderId`、`orderStatus = 3`、`finishTime`。
+
+**（4）超时巡检 `scanTimeout`**（`OrderTimeoutTask` 每小时执行）
+
+1、三类扫描分别执行，互不影响：
+
+| 段 | 扫描条件 | 处置 |
+| --- | --- | --- |
+| 待确认 | `order_status = 0 AND create_time < now - 24h` | 置 `4` 已取消，原因“超时未接单”，成对解锁 |
+| 待预约 | `order_status = 1 AND create_time < now - 48h` | 置 `4` 已取消，原因“超时未预约”，成对解锁 |
+| 待面交 | `order_status = 2 AND appoint_time < now - 24h` | 置 `5` 已违约，成对解锁，扣发起方 10 分 |
+
+2、每单独立事务：先做条件更新（`WHERE order_status = 原状态`），影响行数为 1 才继续解锁与扣分；为 0 说明已被用户操作抢先，直接跳过——**绝不覆盖用户主动操作的结果**。
+
+3、扣分调用 `CreditService.addScore(fromUserId, -10, "timeout", orderId)`，`ref_id` 记订单号，便于申诉回溯；同一订单因条件更新守卫只会扣一次。
+
+4、返回本次处置单数，写入定时任务日志；单次处理上限 500 单，避免长事务拖垮连接池。
 
 ### 4、关键规则
-（角色隔离防自核销、条件更新幂等防重复加分、24h/48h/24h 三段超时规则与默认归责扣发起方分 + 申诉救济）
+
+1、**角色隔离防自核销**：出码仅 `to_user_id`、核销仅 `from_user_id`，两者在 Controller 之外还要在 Service 再校验一次（拦截器只校验登录态，不区分单据角色）。这是本模块最关键的一条——任一方能在交付前独自完成核销，整个履约约束就失效了。
+
+2、**核销码不可回传、不可枚举**：`verify_code` 为 32 位 UUID 派生值，只经二维码下发；`OrderDetailVO` 与预约响应都不含该字段。
+
+3、**幂等靠条件更新而非查询判断**：`2 -> 3` 的条件更新是唯一闸口，重复提交影响行数为 0 → `2102`，且第 6 步加分根本不会执行，从根上杜绝重复加分。
+
+4、**三段超时统一归口**：`0` 超 24h、`1` 超 48h 均无责取消（用户未推进流程）；`2` 超预约 24h 判违约并默认扣发起方 10 分（按《03-01》第 206 行口径），物品所有者爽约或归责不明时，发起方可经模块 07 提交**单次**申诉，由管理员复核撤回扣分或转扣违约方。
+
+5、**超时不越权**：定时任务只处理“仍未推进”的单据，且以条件更新为准；用户刚操作完的单据不会被定时任务覆盖。
+
+6、**二维码内容带前缀**：`CL-VERIFY:` 前缀用于区分本系统码与外部二维码，扫描后仅解析前缀匹配的载荷，降低误扫风险。
+
+7、**预约粒度与时段**：09:00–21:00、30 分钟一档，与自提点值守时间对齐；不做跨天预约，避免“预约在闭馆时段”导致必然违约。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1003`/`1005`/`2102`/`2103`/`2104` 及提示语）
+
+| 错误码 | 触发场景 | 提示语 |
+| --- | --- | --- |
+| `1001` | 预约时间缺失/已过/不在 09:00–21:00/非整半点、自提点不在白名单、核销码为空 | 请选择有效的面交时间与自提点 |
+| `1003` | 非参与方预约、发起方取二维码、所有者调用核销 | 无权执行该操作 |
+| `1005` | 账号已停用 | 账号已停用，请联系管理员 |
+| `2102` | 未接单即预约、重复预约、重复核销、已完成或已取消单据再操作 | 当前状态不允许该操作 |
+| `2103` | 核销码不匹配或已被使用 | 核销码无效，请重新扫码 |
+| `2104` | 超过预约时间 24 小时已被判违约关闭 | 该流转单已超时关闭，如有异议可提交申诉 |
 
 ## （八）物品检索与筛选（模块 08）
 
 ### 1、类与职责
-（覆盖 `ItemSearchController`、`ItemSearchService`、`CategoryMapper`、`ItemSearchQuery`、`ItemCardVO`、`CategoryTreeVO`）
+
+| 类 / 接口 | 所在包 | 职责 |
+| --- | --- | --- |
+| `ItemSearchController` | `controller` | 暴露检索与分类树两个公开接口 |
+| `ItemSearchService` / `ItemSearchServiceImpl` | `service` | 条件装配、排序白名单映射、分页、热门词写入、空结果兜底 |
+| `ItemMapper`（检索部分） | `mapper` | 动态条件查询在售物品、按分类与热度取兜底列表 |
+| `CategoryMapper` | `mapper` | 查询 `is_show = 1` 的分类并按 `parent_id` 装配两级树 |
+| `ItemSearchQuery` | `dto` | `keyword`、`categoryId`、`conditionLevel`、`campus`、`tradeMode`、`minPrice`、`maxPrice`、`sort`、`page`、`pageSize` |
+| `ItemCardVO` | `vo` | 卡片字段：`id`、`title`、`coverUrl`、`price`、`tradeMode`、`campus`、`conditionLevel`、`viewCount` |
+| `CategoryTreeVO` | `vo` | `id`、`categoryName`、`children`（二级） |
+| `SortWhitelist` | `enums` / `config` | `Map<String, String>` 排序白名单：`latest`→`create_time DESC`、`hot`→`view_count DESC`、`price_asc`、`price_desc` |
 
 ### 2、方法设计
-（对应 `GET /api/items`、`GET /api/categories/tree`）
+
+| 方法签名 | 对应接口 | 事务 |
+| --- | --- | --- |
+| `ItemSearchResultVO search(ItemSearchQuery query)` | `GET /api/items` | 否（只读） |
+| `List<CategoryTreeVO> categoryTree()` | `GET /api/categories/tree` | 否（只读） |
+
+```java
+public interface ItemSearchService {
+
+    /** 多条件检索：固定过滤在售未删除，排序走白名单，空结果返回兜底列表 */
+    ItemSearchResultVO search(ItemSearchQuery query);
+
+    /** 启用状态的二级分类树（一次查询后在内存装配，避免 N+1） */
+    List<CategoryTreeVO> categoryTree();
+}
+```
 
 ### 3、处理流程
-（白名单排序映射 → 固定过滤 `status=1 AND is_deleted=0` → 分页查询 → 写入 `cl:search:hot` → 空结果召回同分类兜底）
+
+**（1）检索 `search`**
+
+1、`@Valid` 校验：`pageSize` 裁剪至 1–50、`page >= 1`；`minPrice > maxPrice` 直接交换两者（宽容处理而非报错，价格区间本无方向语义）；`minPrice`/`maxPrice` 为负 → `1001`。
+
+2、**排序白名单映射**：`sort` 经 `SortWhitelist` 转成 SQL 片段，未命中则回落 `latest`；**前端传入的字符串永远不进 SQL**，只有 `Map` 里的固定值可以拼进 `ORDER BY`。
+
+3、**固定过滤**：`status = 1 AND is_deleted = 0`，由 Mapper 的 `<where>` 前置写死，不接受调用方覆盖。
+
+4、动态条件：`categoryId`（含其二级子分类，用 `IN`）、`conditionLevel`、`campus`、`tradeMode` 等值匹配；`keyword` 对 `title`、`description` 做 `LIKE '%kw%'`，并对 `%`、`_`、`\` 转义。
+
+5、`PageHelper.startPage(page, pageSize)` 后紧跟单条查询，返回 `PageInfo<ItemCardVO>`。
+
+6、**热门词写入**：检索有结果时以 `try/catch` 调 `RedisHelper` 对 `cl:search:hot` 执行 `ZINCRBY keyword 1` 并续期 7 天；失败仅记 `warn`，不影响返回。
+
+7、**空结果兜底**：`total == 0` 且传了 `categoryId` 时，追加一次同分类在售热门查询（`ORDER BY view_count DESC LIMIT 4`），放 `fallbackList` 供前端渲染“同类热门”；无 `categoryId` 则不兜底，返回空列表（搜索“不存在的东西”不该被强行塞结果）。
+
+**（2）分类树 `categoryTree`**
+
+1、一次查询 `SELECT * FROM category WHERE is_show = 1 ORDER BY parent_id, sort_no`。
+
+2、内存中按 `parent_id = 0` 取一级、其余归入对应父节点；**两级封顶**，出现三级数据直接忽略（防止字典误配导致前端嵌套渲染错乱）。
+
+3、结果可按 `campus` 配置缓存，但本版不做缓存——分类字典仅 60 行级，直查比维护缓存失效更简单。
 
 ### 4、关键规则
-（排序白名单防 SQL 注入、组合索引命中、每页 12 条上限 50）
+
+1、**排序白名单防注入**：`ORDER BY` 是 MyBatis 唯一无法用 `#{}` 参数化的位置，因此只允许从固定 `Map` 取值，禁止 `ORDER BY ${sort}` 直传。
+
+2、**组合索引命中**：分类 + 在售态走 `idx_cate_status(category_id, status)`，校区 + 在售态走 `idx_campus_status(campus, status)`；因此 `categoryId`/`campus` 条件必须与 `status` 同时出现才能命中组合索引（固定过滤保证了这一点）。
+
+3、**只在售可见**：`status = 1 AND is_deleted = 0` 是硬过滤，不做“管理员可见全部”的分支——后台用独立接口（模块 12），避免一套 SQL 两种语义。
+
+4、**分页稳定**：`ORDER BY` 末尾补 `id DESC` 兜底，防止 `view_count` 相同的记录在翻页时重复或遗漏。
+
+5、**关键词最短长度**：`keyword` 去空格后长度 < 2 视为未传，避免单字导致全表 `LIKE` 扫描。
+
+6、**兜底不掩盖空态语义**：只有传了分类才兜底，且明确放在 `fallbackList` 字段而非混入 `list`，前端能区分“搜到了”与“没搜到但给你看同类”。
 
 ### 5、异常分支
-（写明错误码 `1001`/`5001` 及提示语）
+
+| 错误码 | 触发场景 | 提示语 |
+| --- | --- | --- |
+| `1001` | `page`/`pageSize` 非法、价格为负、金额格式错误 | 查询条件有误 |
+| `5001` | 分类树查询异常、SQL 执行异常 | 系统繁忙，请稍后重试 |
+
+> Redis 写热门词失败不对外暴露错误码：该操作不影响检索结果，仅记 `warn` 日志（不满足“依赖不可用”`5002` 的判定，因为主链路未降级）。
 
 ## （九）智能标签推荐（模块 09）
 
 ### 1、类与职责
-（覆盖 `RecommendController`、`RecommendService`、`RecommendServiceImpl`、`RecommendItemVO`）
+
+| 类 / 接口 | 所在包 | 职责 |
+| --- | --- | --- |
+| `RecommendController` | `controller` | 暴露推荐列表与收藏切换两个接口 |
+| `RecommendService` / `RecommendServiceImpl` | `service` | 标签加权、TOP 5 召回、热度排序、缓存回填、三级降级 |
+| `TagService` | `service` | 独立封装 `cl:tag:user:{userId}` 的累加与续期，供浏览、收藏、发布三处调用 |
+| `RecommendItemVO` | `vo` | `id`、`title`、`coverUrl`、`price`、`campus`、`reason`（推荐理由文案） |
+| `ItemMapper`（推荐部分） | `mapper` | 按分类批量召回在售物品、按校区取热度 TOP |
+| `RedisHelper` | `util`（模块 01 公共组件） | 封装 ZSet/String 读写、TTL 与 `try/catch` 降级 |
 
 ### 2、方法设计
-（对应 `GET /api/recommendations`、`POST /api/items/{id}/favorite` 及内部异步打标方法）
+
+| 方法签名 | 对应接口 | 事务 |
+| --- | --- | --- |
+| `List<RecommendItemVO> recommend(String campus, LoginUser current)` | `GET /api/recommendations` | 否（只读，含缓存回写） |
+| `Boolean toggleFavorite(Integer itemId, LoginUser current)` | `POST /api/items/{id}/favorite` | 是 |
+| `void addTagWeight(Integer userId, Integer categoryId, int weight)` | 内部方法（`@Async`） | 否 |
+| `void refreshTagTtl(Integer userId)` | 内部方法 | 否 |
+
+```java
+public interface RecommendService {
+
+    /** 首页为你推荐 12 条；未登录/冷启动/Redis 异常自动降级 */
+    List<RecommendItemVO> recommend(String campus, LoginUser current);
+
+    /** 收藏/取消收藏，并异步累加标签权重 +3 */
+    Boolean toggleFavorite(Integer itemId, LoginUser current);
+
+    /** 异步打标：浏览 +1、收藏 +3、发布 +5 */
+    void addTagWeight(Integer userId, Integer categoryId, int weight);
+}
+```
 
 ### 3、处理流程
-（读 `cl:rec:cache:{userId}` → 未命中则读 `cl:tag:user:{userId}` TOP 5 召回排序并写 10 分钟缓存 → 冷启动或 Redis 异常降级 `cl:rank:hot:{campus}` 或数据库热度查询）
+
+**（1）推荐列表 `recommend`**
+
+1、未登录：跳过个性化，直接走降级链第 2 级（校区热门榜）。
+
+2、**读缓存**：`RedisHelper.get(RedisKey.recCache(userId))`；命中且非空则直接返回（缓存内 12 条，前端“换一批”在本地轮换，不再打接口）。
+
+3、**未命中 → 读标签**：`ZREVRANGE cl:tag:user:{userId} 0 4 WITHSCORES` 取权重 TOP 5 的分类 ID。
+
+4、**召回与排序**：按 5 个分类批量查在售物品（`status = 1 AND is_deleted = 0`），按 `view_count DESC` 排序，取前 12 条；同分类内按权重高的优先，保证“最常看的分类”排在前面。
+
+5、**生成推荐理由**：对每条结果，取其所命中分类的名称拼文案——「因为你常看「数码电子」」，权重来自第一优先分类时用「你最近关注」。文案由服务端生成而非前端拼接，保证多端一致。
+
+6、**回填缓存**：`SETEX cl:rec:cache:{userId} 600 <json>`，10 分钟；序列化用 Jackson，VO 标注 `@JsonIgnoreProperties(ignoreUnknown = true)`。
+
+**（2）降级链（三级）**
+
+| 级别 | 触发条件 | 数据来源 | 前端表现 |
+| --- | --- | --- | --- |
+| 1 | 标签非空、Redis 正常 | `cl:tag:user` TOP 5 召回 | “为你推荐”+ 个性化理由 |
+| 2 | 未登录、新用户无标签、标签为空 | `cl:rank:hot:{campus}` ZSet（读失败再退 3） | “同校区热门”，附“换一批” |
+| 3 | Redis 整体不可用 | 直接查 `item`：`status=1` 按 `view_count DESC` + `campus` 过滤 `LIMIT 12` | “同校区热门”（与 2 同文案，用户无感） |
+
+**（3）收藏切换与打标 `toggleFavorite`**
+
+1、查物品，不存在或非在售 → `1001`/`2102` 由模块 02 的口径统一，本接口只需保证 `itemId` 合法。
+
+2、事务内切换收藏状态（本版以 `cl:fav:user:{userId}` Set 承载，不新增表；如需持久化统计再扩表，超出 15 表范围需组长确认）。
+
+3、返回 `favorited` 布尔值。
+
+4、事务提交后异步调用 `addTagWeight(userId, item.categoryId, +3)`；取消收藏不回减权重（权重代表兴趣强度，不随一次取消归零）。
+
+**（4）异步打标 `addTagWeight`**
+
+1、`@Async` 执行，`ZINCRBY cl:tag:user:{userId} {weight} {categoryId}`。
+
+2、随后 `EXPIRE cl:tag:user:{userId} 2592000`（30 天），实现“每次行为后续期”。
+
+3、全程 `try/catch`，失败仅 `warn`——打标丢失影响下一次推荐质量，不影响本次请求。
+
+4、浏览详情在模块 02 的详情接口内触发 `+1`，发布在模块 02 审核通过后触发 `+5`，三处统一调用 `TagService`，权重常量集中定义在 `RecommendConst`。
 
 ### 4、关键规则
-（浏览 `+1`/收藏 `+3`/发布 `+5` 与 30 天续期、推荐理由文案生成、所有 Redis 读写 `try/catch` 降级）
+
+1、**权重口径固定**：浏览 `+1`、收藏 `+3`、发布 `+5`，与《03-01》第 258 行一致；权重只增不减，靠 30 天 TTL 自然衰减，避免维护“减权重”的复杂逻辑。
+
+2、**缓存 TTL 10 分钟**：过短会导致首页每次都走召回查询，过长会让新发布物品迟迟不出现；10 分钟是“可见性”与“数据库压力”的折中。
+
+3、**所有 Redis 读写必须 `try/catch`**：这是《03-01》非功能设计（三）的硬要求；本模块是 Redis 依赖最重的模块，降级链三级保证“Redis 全挂首页仍可用”。
+
+4、**推荐理由必须可解释**：理由文案只能来自“实际命中的标签分类名”，禁止生成“猜你喜欢”这类无信息量文案——验收时要能指着一条推荐说出为什么推它。
+
+5、“**换一批**”在缓存内轮换：接口固定返回 12 条，前端本地轮换，不打接口；否则每次点击都触发一次召回，缓存形同虚设。
+
+6、**打标与业务解耦**：打标是异步旁路，任何失败不得影响收藏、浏览、发布的主流程（与模块 04 邀约通知的“必须成功”策略相反，因为打标是本模块的旁路增强）。
+
+7、**推荐不返回敏感字段**：`RecommendItemVO` 不含 `owner_id`、`description` 全文，减少一次请求的数据量与越权探测面。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1002`/`1005`/`5001` 与降级行为）
+
+| 错误码 | 触发场景 | 提示语 | 降级行为 |
+| --- | --- | --- | --- |
+| `1001` | `itemId` 非法或缺失 | 参数错误 | — |
+| `1002` | 未登录调用收藏接口 | 请先登录 | — |
+| `1005` | 账号已停用 | 账号已停用，请联系管理员 | — |
+| `5001` | 数据库查询异常（三级降级全部失效） | 系统繁忙，请稍后重试 | 首页展示空态与“最新发布”列表 |
+| 不抛出 | Redis 连接失败或超时 | — | 记 `warn`，按降级链 2/3 返回，接口仍返回 `code=0` |
+
+> 说明：Redis 故障按《03-01》要求走降级而非报 `5002`——`5002` 保留给“核销/凭证等主链路依赖不可用且无法降级”的场景（本模块主链路可降级，故不适用）。
 
 ---
 

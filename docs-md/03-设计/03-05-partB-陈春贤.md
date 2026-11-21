@@ -1003,7 +1003,7 @@ ON DUPLICATE KEY UPDATE
 
 **口径差异标注（需组长确认，未擅自定稿）**：
 
-1、《03-01 V1.1》第五章（二）与（三）只定义了 15 张表，其中**没有自提点表、也没有积分规则表**，但同文档第 873 行要求初始化“4 个校内自提点与 5 条积分规则”，模块 12 也提到“维护自提点与积分规则字典”。为不擅自扩表（15 表为冻结范围），本版把这两类数据落为**配置字典**：自提点走 `application.yml` 的 `campus-loop.pickup-points`，积分规则走 `CreditRuleEnum`（键与 `credit_log.reason_type` 对齐）。若确需后台可视化维护，应新增 `sys_dict` 表——此举超出 15 表范围，须由组长在合稿时确认。
+1、《03-01 V1.1》第五章（二）与（三）只定义了 15 张表，其中**没有自提点表、也没有积分规则表**，但同文档第 873 行要求初始化“4 个校内自提点与 5 条积分规则”，模块 12 也提到“维护自提点与积分规则字典”。为不擅自扩表（15 表为冻结范围），本版把这两类数据落为**配置字典**：自提点走 `jdbc.properties` 的 `campus-loop.pickup-points`，积分规则走 `CreditRuleEnum`（键与 `credit_log.reason_type` 对齐）。若确需后台可视化维护，应新增 `sys_dict` 表——此举超出 15 表范围，须由组长在合稿时确认。
 
 2、自提点取值以《01-02 需求调研记录》第 118 行原文为准，可得 3 个明确点位；第 4 个点位在现有文档中无出处，标注为**待组长补充**，不在本脚本中臆造：
 
@@ -1026,21 +1026,19 @@ ON DUPLICATE KEY UPDATE
 | `report_valid` | 举报核实成立 | -15 | 《01-02》第 119 行、《03-01》第 294 行 |
 | `appeal_refund` | 积分申诉复核通过回补 | 按原扣分回补 | 《03-01》第 685 行 |
 
-```yaml
-# application.yml 片段：自提点与积分规则以配置字典落地（不占 15 张表）
-campus-loop:
-  pickup-points:
-    - 本部图书馆南门（有监控）
-    - 三舍楼下服务点
-    - 二食堂门口
-  credit:
-    publish: 2
-    finish: 5
-    good-review: 3
-    donation: 5
-    no-show: -10
-    report-valid: -15
+```properties
+# jdbc.properties 片段：自提点与积分规则以配置字典落地（不占 15 张表）
+# 注意：本项目为 SSM（非 Spring Boot），配置为 properties + Spring XML，无 application.yml
+campus-loop.pickup-points=本部图书馆南门（有监控）,三舍楼下服务点,二食堂门口
+campus-loop.credit.publish=2
+campus-loop.credit.finish=5
+campus-loop.credit.good-review=3
+campus-loop.credit.donation=5
+campus-loop.credit.no-show=-10
+campus-loop.credit.report-valid=-15
 ```
+
+上述键由 `applicationContext.xml` 的 `<context:property-placeholder location="classpath:jdbc.properties"/>` 加载，自提点字符串在 `AppointServiceImpl` 中按逗号切分为 `Set<String>` 做白名单校验，积分规则在 `CreditRuleEnum` 中以 `@Value` 注入分值，禁止在业务代码中硬编码数字。
 
 ## （六）Redis 键落地规范
 
@@ -1130,14 +1128,383 @@ public <T> T getOrDegrade(String key, Supplier<T> loader, Supplier<T> fallback) 
 
 # 七、关键流程时序（Part B 负责第 1、4 条）
 
+> 说明：本章以「参与方 → 动作 → 事务边界 → 失败分支」的表格化时序描述，不使用图形。原因是交付物需经 Pandoc 导出 Word，图形在跨页时易丢失或被裁切，而表格可逐行比对，便于 11/25 三份文档交叉自检时定位差异。
+
 ## （一）以物易物全流程（含角色隔离核销）
-（按步给出参与方、Controller、Service、Mapper、事务边界：发起成对锁单 → 确认 → 预约 → 所有者展示二维码 → 发起方扫码条件更新核销 → 积分加分与消息通知）
+
+### 1、参与方与前置条件
+
+| 代号 | 角色 | 对应字段 | 本流程中的权限边界 |
+| --- | --- | --- | --- |
+| A | 发起方（学生） | `exchange_order.from_user_id` | 可下单、可取消、**唯一可核销**、可评价 |
+| B | 物品所有者 | `exchange_order.to_user_id` | 可接单、可取消、**唯一可取核销码**、可评价 |
+| I₁ | 目标物品 | `item.id = exchange_order.item_id` | 由 B 发布，`status = 1` 在售 |
+| I₂ | 换出物品 | `item.id = exchange_order.offer_item_id` | 由 A 发布，`status = 1` 在售 |
+| M₇ | 模块 07 诚信积分 | `CreditService` | 被模块 05 单向调用，不反向依赖 |
+| M₁₀ | 模块 10 站内消息 | `NotifyService` | 横切底座，仅被调用 |
+
+前置条件：A、B 均 `auth_status = 1` 且 `status = 1`；I₁、I₂ 均 `status = 1 AND is_deleted = 0`；I₁ 的 `trade_mode = exchange`。
+
+### 2、阶段一：发起与成对锁单
+
+| 步 | 发起方 | 接收方 | 动作 | 事务 |
+| --- | --- | --- | --- | --- |
+| 1 | A（浏览器 `[UI-07]`） | `OrderController` | `POST /api/orders`：`itemId=I₁`、`tradeMode=exchange`、`offerItemId=I₂`、`message` | — |
+| 2 | `OrderController` | `OrderService.create` | `@Valid` 校验；取 Session `LoginUser` | 事务外 |
+| 3 | `OrderServiceImpl` | `ItemMapper` | 查 I₁ 与 I₂，校验在售、非本人、模式一致、I₂ 归属 A | 只读 |
+| 4 | `OrderServiceImpl` | `ItemMapper.lockItem(I₁)` | `UPDATE item SET status=2 WHERE id=? AND status=1 AND is_deleted=0` | **事务内** |
+| 5 | 同上，影响行数=0 | — | 抛 `BizException(2101)`，事务回滚 | 回滚 |
+| 6 | `OrderServiceImpl` | `ItemMapper.lockItem(I₂)` | 同条件更新换出物品；影响行数=0 同样 `2101` 并回滚（I₁ 锁定一并撤销） | **事务内** |
+| 7 | `OrderServiceImpl` | `ExchangeOrderMapper.insert` | 插入单据：`order_status=0`、`order_no=CL+日期+序号`、`verify_code=NULL` | **事务内** |
+| 8 | 事务提交 | — | 锁单完成 | 提交点 |
+| 9 | `OrderServiceImpl` | `NotifyService`（模块 10） | `AFTER_COMMIT` 异步通知 B“有人想换你的物品” | 事务外 |
+
+**关键点**：第 4–7 步必须在同一个事务内。若拆成两个事务，会出现“目标物品已锁、换出物品未锁”的半锁状态，该物品将既不能被别人下单、也无法被 A 用于其他交换，只能等 24 小时超时任务解锁。
+
+### 3、阶段二：接单确认
+
+| 步 | 发起方 | 接收方 | 动作 | 事务 |
+| --- | --- | --- | --- | --- |
+| 10 | B（`[UI-08]`） | `OrderController` | `POST /api/orders/{id}/confirm` | — |
+| 11 | `OrderServiceImpl` | `ExchangeOrderMapper` | 校验参与方身份（B 必须是 `to_user_id`，否则 `1003`） | 只读 |
+| 12 | 同上 | `ExchangeOrderMapper` | `UPDATE exchange_order SET order_status=1 WHERE id=? AND order_status=0` | **事务内** |
+| 13 | 同上，影响行数=0 | — | 抛 `2102`（已确认/已取消/已违约） | 回滚 |
+| 14 | `OrderServiceImpl` | `NotifyService` | `AFTER_COMMIT` 通知 A“对方已接单，请在 48 小时内预约” | 事务外 |
+
+### 4、阶段三：预约与出码（角色隔离起点）
+
+| 步 | 发起方 | 接收方 | 动作 | 事务 |
+| --- | --- | --- | --- | --- |
+| 15 | A 或 B（`[UI-09]`） | `OrderController` | `POST /api/orders/{id}/appointment`：`appointTime`（09:00–21:00 整半点）、`appointPlace`（自提点白名单） | — |
+| 16 | `AppointmentServiceImpl` | — | 校验：参与方、状态必须为 `1`、时间在未来且合法、地点在白名单 | 只读 |
+| 17 | 同上 | `IdUtil.nextVerifyCode()` | 生成 32 位一次性核销码 | 事务外 |
+| 18 | `AppointmentServiceImpl` | `ExchangeOrderMapper` | `UPDATE ... SET order_status=2, appoint_time=?, appoint_place=?, verify_code=? WHERE id=? AND order_status=1` | **事务内** |
+| 19 | 同上，影响行数=0 | — | 抛 `2102`（并发重复预约） | 回滚，`verify_code` 作废 |
+| 20 | `AppointmentServiceImpl` | — | 出参**不含 `verify_code`**，仅返回时间与地点 | — |
+| 21 | B | `OrderController` | `GET /api/orders/{id}/qrcode`：校验 `to_user_id`，`QrCodeUtil` 生成 `CL-VERIFY:{code}` 的 PNG 流 | 只读 |
+| 22 | 同上，非 B 调用 | — | 抛 `1003`；单据状态非 `2` 抛 `2102` | — |
+
+**关键点**：第 20 步是整个角色隔离设计的核心——核销码只存在于二维码图像里，接口响应中永不出现。因此“能看到码的人（A）无法从接口拿到码，能调用取码接口的人（B）不能提交核销”，任一方都无法在交付前独自完成闭环。
+
+### 5、阶段四：核销（幂等闸口）
+
+| 步 | 发起方 | 接收方 | 动作 | 事务 |
+| --- | --- | --- | --- | --- |
+| 23 | A 当面扫码 | `OrderController` | `POST /api/orders/{id}/verify`：`verifyCode` 来自扫码解析 | — |
+| 24 | `AppointmentServiceImpl` | `ExchangeOrderMapper` | 校验 A 是否为 `from_user_id`（否则 `1003`）；状态 `3`→`2102`、`5`→`2104` | 只读 |
+| 25 | 同上 | — | 常量时间比较 `verifyCode` 与库中值，不等抛 `2103` | — |
+| 26 | 同上 | `ExchangeOrderMapper.verify` | `UPDATE exchange_order SET order_status=3, finish_time=NOW() WHERE id=? AND order_status=2` | **事务内** |
+| 27 | 同上，影响行数=0 | — | 抛 `2102`（并发重复核销）；**后续加分代码不会执行** | 回滚 |
+| 28 | 同上 | `ItemMapper` | I₁ 由 `2` 置 `3` 已完成；I₂ 同样置 `3` | **事务内** |
+| 29 | 同上 | `CreditService`（模块 07） | A、B 各 `+5`（`reason_type=finish`，`ref_id=orderId`）：写 `credit_log` + 原子更新 `user.credit_score` | **同事务** |
+| 30 | 事务提交 | — | 核销完成 | 提交点 |
+| 31 | `AppointmentServiceImpl` | `NotifyService` + 模块 07 评价提醒 | `AFTER_COMMIT` 通知双方“已核销，7 天内可互评” | 事务外 |
+
+**关键点**：第 26 步的条件更新是**唯一幂等闸口**。两个核销请求并发时，数据库行锁保证只有一个能拿到影响行数 1，另一个在第 27 步被拦下，因此第 29 步的加分绝不会重复执行——这比“先查状态再决定是否加分”可靠得多。
+
+### 6、阶段五：互评
+
+| 步 | 发起方 | 接收方 | 动作 | 事务 |
+| --- | --- | --- | --- | --- |
+| 32 | A / B（`[UI-08]` 唤起弹窗） | `ReviewController`（模块 07） | `POST /api/reviews`：`orderId`、`score`、`content`、`tags` | — |
+| 33 | 同上 | — | 校验：参与方、订单已完成、完成时间在 7 天内（超期 `2302`）、未评价过 | — |
+| 34 | 同上 | `ReviewMapper` | 插入评价，触发 `uk_order_from` 唯一索引；冲突返回 `2301` | 事务内 |
+| 35 | 同上 | `CreditService` | 收到好评方 `+3`（`good_review`） | 同事务 |
+
+### 7、事务边界与幂等闸口汇总
+
+| 阶段 | 事务范围 | 幂等手段 | 失败后果 |
+| --- | --- | --- | --- |
+| 发起锁单 | `exchange_order` 插入 + 两件 `item` 条件更新 | `WHERE status=1` 条件更新 + `uk_order_no` | 整体回滚，物品均回到在售 |
+| 接单 | 单据状态 `0→1` | `WHERE order_status=0` | 回滚，仍为待确认 |
+| 预约 | 单据 `1→2` + 写入 `verify_code` | `WHERE order_status=1` | 回滚，核销码作废不可用 |
+| 核销 | 单据 `2→3` + 两件物品置完成 + 双方加分 | `WHERE order_status=2` | 整体回滚，不产生“核销了没加分” |
+| 取消 | 单据 →`4` + 成对解锁 | `WHERE order_status IN (0,1,2)` | 回滚，单据状态不变 |
+| 互评 | 评价插入 + 加分 | `uk_order_from` 唯一索引 | 冲突返回 `2301`，无副作用 |
+
+### 8、超时与异常分支
+
+| 场景 | 触发条件 | 系统动作 | 用户可见结果 |
+| --- | --- | --- | --- |
+| 抢单失败 | 他人已锁 I₁ 或 I₂ | 事务回滚，返回 `2101` | “手慢了，该物品已被抢先锁定” |
+| 超时未接单 | `0` 状态超 24 小时 | 置 `4`，成对解锁，原因“超时未接单” | 详情显示已取消，物品回到在售 |
+| 超时未预约 | `1` 状态超 48 小时 | 置 `4`，成对解锁，原因“超时未预约” | 同上 |
+| 面交未核销 | `2` 状态超预约时间 24 小时 | 置 `5` 违约，成对解锁，扣 A `-10` | 详情显示已违约，A 信用分下降 |
+| 归责争议 | 实际为 B 爽约 | A 经模块 07 提交单次申诉（写 `report` 工单） | 管理员复核后回补或转扣 B |
+| 核销码错误 | 扫码内容不匹配 | 返回 `2103`，单据状态不变 | “核销码无效，请重新扫码” |
+| 重复核销 | A 重复提交或网络重试 | 条件更新影响行数 0，返回 `2102` | 提示已完成，不重复加分 |
+| 超时后核销 | 单据已被判 `5` 违约 | 返回 `2104` | “该流转单已超时关闭，如有异议可提交申诉” |
 
 ## （四）推荐降级流程
-（按步给出正常路径与 Redis 不可用/冷启动时的两级降级链路）
+
+### 1、参与方与数据来源
+
+| 代号 | 组件 | 承载数据 | 本流程中的作用 |
+| --- | --- | --- | --- |
+| U | 当前用户 | `userId`、`campus` | 决定个性化标签与校区热榜 |
+| R | Redis | `cl:tag:user:{userId}`、`cl:rec:cache:{userId}`、`cl:rank:hot:{campus}` | 标签权重、结果缓存、热榜 |
+| D | MySQL | `item`、`category` | 召回在售物品、分类名与兜底热度 |
+| S | `RecommendServiceImpl` | — | 编排三级降级、生成推荐理由 |
+
+### 2、正常路径（L1：个性化推荐）
+
+| 步 | 发起方 | 接收方 | 动作 | 降级判定 |
+| --- | --- | --- | --- | --- |
+| 1 | 首页 `[UI-02]` | `RecommendController` | `GET /api/recommendations?campus=本部` | — |
+| 2 | `RecommendController` | `RecommendServiceImpl` | 取 Session；未登录则直接转 L2 | 未登录 → L2 |
+| 3 | `RecommendServiceImpl` | `RedisHelper.get(recCache)` | 读推荐缓存 | 命中 → 直接返回 12 条 |
+| 4 | `RecommendServiceImpl` | `RedisHelper.zrevrange(userTag, 0, 4)` | 取权重 TOP 5 分类 | 空或异常 → L2 |
+| 5 | `RecommendServiceImpl` | `ItemMapper` | 按 5 个分类批量召回 `status=1 AND is_deleted=0`，按 `view_count DESC` 取 12 条 | 查询异常 → `5001` |
+| 6 | `RecommendServiceImpl` | — | 按“分类权重降序 + 热度降序”重排，取前 12 | — |
+| 7 | `RecommendServiceImpl` | — | 生成理由文案：命中第一优先分类用“你最近关注「X」”，其余用“因为你常看「X」” | — |
+| 8 | `RecommendServiceImpl` | `RedisHelper.setex(recCache, 600, json)` | 回填缓存，TTL 10 分钟 | 写失败仅 `warn` |
+| 9 | `RecommendController` | 前端 | 返回 `List<RecommendItemVO>`（12 条，含 `reason`） | — |
+
+### 3、降级判定与链路
+
+| 级别 | 触发条件 | 数据来源 | 返回内容 | 前端文案 |
+| --- | --- | --- | --- | --- |
+| L1 个性化 | 已登录 + 标签非空 + Redis 正常 | `cl:tag:user` TOP 5 → `item` 召回 | 12 条 + 个性化理由 | “为你推荐” |
+| L2 校区热榜 | 未登录 / 新用户无标签 / 标签为空 / 标签读异常 | `cl:rank:hot:{campus}` ZSet 取 TOP 12 | 12 条 + “同校区热门”理由 | “同校区热门” |
+| L3 数据库兜底 | L2 的 ZSet 也为空或读失败 | `item` 直查：`campus=? AND status=1 AND is_deleted=0 ORDER BY view_count DESC LIMIT 12` | 12 条 + 统一理由“同校区热门” | “同校区热门” |
+| 空态 | L3 仍无数据（新部署、无在售） | — | 空列表 | 展示“暂无推荐，去逛逛最新发布” |
+
+**降级触发点**：第 2 步（未登录）、第 4 步（标签为空或 Redis 抛异常）、L2 的 ZSet 为空、L3 的 SQL 异常。四个触发点均在 `try/catch` 内判定，任一异常只降一级、不抛给用户——**首页永不因 Redis 故障白屏**。
+
+### 4、时效与缓存策略
+
+| 缓存键 | TTL | 为何是这个值 |
+| --- | --- | --- |
+| `cl:rec:cache:{userId}` | 10 分钟 | 短于此会让每次首页刷新都走召回查询；长于此会让新发布物品迟迟不出现 |
+| `cl:tag:user:{userId}` | 30 天（每次打标续期） | 兴趣以“月”为衰减周期，靠 TTL 自然过期，不维护减权重逻辑 |
+| `cl:rank:hot:{campus}` | 1 天 | 热榜按天更新即可，由发布/成交事件增量写入 |
+
+### 5、与模块 08 的关系
+
+模块 09 只做“召回与排序”，不重复实现检索逻辑：召回阶段的在售过滤（`status=1 AND is_deleted=0`）复用模块 08 的固定条件口径，两者共用 `ItemMapper` 的查询片段。区别在于模块 08 面向“用户主动筛选”，必须支持任意组合条件与分页；模块 09 面向“系统主动推送”，只按分类与热度取固定 12 条，因此不复用 `PageHelper`，直接 `LIMIT` 取数。
 
 ---
 
 # 十一、部署与配置
 
-（单机 Tomcat 10.1.61 + MySQL 5.7.17 + Redis 5.0 环境参数、外部 `upload/` 静态映射与 `certificate/` 非静态受保护目录配置、启动检查清单、SQL 快照备份与 Git Tag WAR 包 5 分钟回滚步骤）
+> 本项目为 **Java SSM 单体应用**（Spring 6.2.11 + SpringMVC + MyBatis，打 WAR 包部署到 Tomcat），**不使用 Spring Boot**，因此配置一律为 `properties` + Spring XML，不存在 `application.yml`。以下所有路径、端口、参数与《03-01 V1.1》第（四）节及《01-05 开发环境清单》一致。
+
+## （一）部署拓扑与版本矩阵
+
+单机轻量部署：一台主机运行 Tomcat 承载 WAR，同机部署 MySQL 与 Redis（课程演示环境不拆分物理机，生产化时才考虑独立主机）。
+
+| 组件 | 版本 | 端口 | 部署位置 | 关键参数 |
+| --- | --- | --- | --- | --- |
+| JDK | 17 | — | `JAVA_HOME` | 编译与运行同版本，避免字节码不兼容 |
+| Tomcat | 10.1.61 | 8080 | `/opt/tomcat` | 单实例；`URIEncoding=UTF-8`；仅配置 `upload/` 静态只读映射 |
+| MySQL | 5.7.17 | 3306 | 同机 | 库名 `campus_loop`，`utf8mb4_general_ci`，InnoDB |
+| Redis | 5.0 | 6379 | 同机 | 独立逻辑库 `database 3`，`maxmemory-policy allkeys-lru` |
+| 应用 WAR | — | — | `/opt/tomcat/webapps/campus-loop.war` | 上下文路径 `/campus-loop` |
+
+**Tomcat 10 的命名空间坑（务必注意）**：Tomcat 10 起 Servlet API 由 `javax.servlet.*` 迁移到 `jakarta.servlet.*`，配套 Spring 6.2.11 与 MyBatis 3.5.19。若误用 Tomcat 9 或引入 `javax.servlet-api` 依赖，启动会抛 `ClassNotFoundException: jakarta.servlet.Filter`，因此依赖树中禁止出现任何 `javax.servlet` 坐标。
+
+| 目录 | 用途 | 权限要求 |
+| --- | --- | --- |
+| `/opt/tomcat/webapps/campus-loop/` | 解压后的应用 | 只读执行 |
+| `/data/campus-loop/upload/` | 物品实拍图（`yyyyMM/`） | Tomcat 运行账号可写；对外静态只读 |
+| `/data/campus-loop/certificate/` | 捐赠凭证 PDF（`yyyyMM/`） | 仅 Tomcat 运行账号可读写；**不对外映射** |
+| `/data/campus-loop/logs/` | 应用与审计日志 | 可写，按天滚动 |
+| `/opt/tomcat/backup/` | WAR 包历史版本 | 只读留存 |
+
+## （二）目录规划与静态资源映射
+
+**1、`upload/` 静态只读映射**
+
+在 `spring-mvc.xml` 中把 URL 路径映射到容器外目录，避免图片打进 WAR（重新部署即丢失）：
+
+```xml
+<!-- spring-mvc.xml：静态资源与视图 -->
+<mvc:resources mapping="/upload/**" location="file:/data/campus-loop/upload/" />
+<mvc:resources mapping="/static/**" location="/static/" />
+
+<mvc:default-servlet-handler />
+<mvc:annotation-driven />
+```
+
+要点：
+
+1、`location` 使用 `file:` 前缀指向容器外绝对路径，WAR 重部署不影响已上传图片。
+
+2、只映射 `/upload/**`，**绝不映射 `/certificate/**`**——后者一旦映射，任何人猜到文件名即可下载他人捐赠凭证。
+
+3、Tomcat 侧需确认未启用 CGI：`conf/web.xml` 的 CGI Servlet 保持注释；`upload/` 目录禁止执行脚本（Linux 下挂载 `noexec` 或将目录属主设为 Tomcat 运行账号且不给组写权限）。
+
+**2、`certificate/` 非静态受保护目录**
+
+1、目录位于 `/data/campus-loop/certificate/`，不在 `webapps` 下，Tomcat 无从将其作为静态资源暴露。
+
+2、唯一访问入口是 `GET /api/donations/{id}/certificate`：`DonationController` 校验当前用户为捐赠人（`donor_id`）或接收社团（`club_id`），通过后由 `FileStorageService.readCertificateStream(certNo, out)` 以 `application/pdf` 流式写出，禁止整文件读入内存（凭证可能含图片，单件可达数 MB）。
+
+3、验真走公开接口 `GET /api/donations/verify?certificateNo=...`，只返回脱敏字段，不返回文件流。
+
+**3、映射自检方法**
+
+| 检查 | 命令 | 通过标准 |
+| --- | --- | --- |
+| 图片可访问 | `curl -I http://localhost:8080/campus-loop/upload/202611/test.jpg` | `200`，`Content-Type: image/jpeg` |
+| 凭证不可静态访问 | `curl -I http://localhost:8080/campus-loop/certificate/202611/CLD001.pdf` | `404`（**不是** `200`，出现 200 说明映射配错） |
+| 凭证接口需鉴权 | `curl -i http://localhost:8080/campus-loop/api/donations/1/certificate` | `200` 响应体内 `code=1002` |
+
+## （三）配置文件清单与关键参数
+
+SSM 项目的配置由四个文件构成，按职责分离，禁止把数据源参数写进 XML 硬编码：
+
+| 文件 | 位置 | 职责 |
+| --- | --- | --- |
+| `jdbc.properties` | `src/main/resources` | 数据源、Redis、上传根路径等环境相关参数 |
+| `applicationContext.xml` | `src/main/resources` | 数据源、`SqlSessionFactory`、事务管理器、扫描 `service` |
+| `spring-mvc.xml` | `src/main/resources` | 扫描 `controller`、静态资源映射、拦截器、视图解析 |
+| `mybatis-config.xml` | `src/main/resources` | 驼峰映射、别名、分页插件 |
+| `web.xml` | `src/main/webapp/WEB-INF` | `DispatcherServlet`、`CharacterEncodingFilter`、Session 超时 |
+
+**`jdbc.properties` 关键项**：
+
+```properties
+# ---------- 数据源 ----------
+jdbc.driver=com.mysql.cj.jdbc.Driver
+jdbc.url=jdbc:mysql://127.0.0.1:3306/campus_loop?useUnicode=true&characterEncoding=utf8mb4&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+jdbc.username=campus_loop
+jdbc.password=${DB_PASSWORD}
+# 连接池（Druid）：最小 5、最大 20，与"50 并发"指标匹配
+jdbc.pool.initialSize=5
+jdbc.pool.minIdle=5
+jdbc.pool.maxActive=20
+jdbc.pool.validationQuery=SELECT 1
+jdbc.pool.testWhileIdle=true
+
+# ---------- Redis ----------
+redis.host=127.0.0.1
+redis.port=6379
+redis.database=3
+redis.timeout=2000
+redis.pool.maxTotal=50
+
+# ---------- 文件目录（容器外，禁止打进 WAR）----------
+file.upload.root=/data/campus-loop/upload/
+file.certificate.root=/data/campus-loop/certificate/
+file.image.maxSize=2097152
+file.image.allowExt=jpg,jpeg,png,webp
+
+# ---------- 业务字典（15 表范围内无字典表，见第五章口径说明）----------
+campus-loop.pickup-points=本部图书馆南门（有监控）,三舍楼下服务点,二食堂门口
+campus-loop.credit.publish=2
+campus-loop.credit.finish=5
+campus-loop.credit.good-review=3
+campus-loop.credit.donation=5
+campus-loop.credit.no-show=-10
+campus-loop.credit.report-valid=-15
+```
+
+**`mybatis-config.xml` 关键项**：
+
+```xml
+<configuration>
+    <settings>
+        <!-- 下划线转驼峰：user_name -> userName，避免 15 张表逐列手写 resultMap -->
+        <setting name="mapUnderscoreToCamelCase" value="true"/>
+        <setting name="cacheEnabled" value="false"/>
+        <setting name="jdbcTypeForNull" value="NULL"/>
+        <setting name="defaultStatementTimeout" value="10"/>
+    </settings>
+    <plugins>
+        <plugin interceptor="com.github.pagehelper.PageInterceptor">
+            <property name="helperDialect" value="mysql"/>
+        </plugin>
+    </plugins>
+</configuration>
+```
+
+> `cacheEnabled=false` 是刻意设置：MyBatis 二级缓存按 namespace 共享，跨模块更新（如模块 05 改单据、模块 07 读单据）会导致读到脏数据，统一改由 Redis 承担缓存职责。
+
+**`web.xml` 关键项**：
+
+```xml
+<!-- 统一 UTF-8，必须在 DispatcherServlet 之前 -->
+<filter>
+    <filter-name>encodingFilter</filter-name>
+    <filter-class>org.springframework.web.filter.CharacterEncodingFilter</filter-class>
+    <init-param><param-name>encoding</param-name><param-value>UTF-8</param-value></init-param>
+    <init-param><param-name>forceEncoding</param-name><param-value>true</param-value></init-param>
+</filter>
+
+<session-config>
+    <session-timeout>30</session-timeout>
+</session-config>
+```
+
+**时区统一**：JDBC URL 的 `serverTimezone=Asia/Shanghai`、JVM 启动参数 `-Duser.timezone=Asia/Shanghai`、MySQL `time_zone='+08:00'` 三者必须一致。任一处不统一，`appoint_time` 的“超预约 24 小时判违约”就会出现整体偏移，这是超时任务最容易踩的坑。
+
+## （四）启动与自检清单
+
+部署后按顺序逐项验证，**任一项不通过不得进入联调**：
+
+| 序 | 检查项 | 命令或操作 | 通过标准 |
+| --- | --- | --- | --- |
+| 1 | JDK 版本 | `java -version` | `17.x` |
+| 2 | 数据库连通 | `mysql -ucampus_loop -p -e "use campus_loop; show tables;"` | 返回 15 张表 |
+| 3 | 初始化数据 | `select count(*) from user;` / `select count(*) from category;` | 用户 4 行、分类 6 行 |
+| 4 | 字符集 | `show variables like 'character_set_database';` | `utf8mb4` |
+| 5 | 时区 | `select @@global.time_zone;` | `+08:00` |
+| 6 | Redis 连通 | `redis-cli -n 3 ping` | `PONG` |
+| 7 | 目录可写 | 上传一张物品图 | 落盘 `/data/campus-loop/upload/yyyyMM/`，DB 有 `item_image` 记录 |
+| 8 | 静态映射 | 浏览器打开该图片 URL | 正常显示，非 404 |
+| 9 | 凭证目录不可访问 | 直接构造 `/certificate/...` URL | 返回 `404` |
+| 10 | 登录链路 | 用 `stu_demo` / `Campus@123` 登录 | 返回 `code=0` 且 Session 有值 |
+| 11 | 敏感字段脱敏 | 抓取任意接口响应 | 不含 `password`、`verify_code`、`student_no` 全量 |
+| 12 | 超时任务开关 | 查看 `OrderTimeoutTask` 日志 | 每小时执行一次，无异常堆栈 |
+
+**日志配置**：`logback.xml` 分三个文件——`app.log`（INFO，按天滚动，保留 30 天）、`error.log`（ERROR，独立文件便于排查）、`oper.log`（操作审计，与模块 14 落库内容一致）。日志中禁止输出密码、token、`verify_code` 与完整学号。
+
+## （五）SQL 快照与 WAR 包回滚（5 分钟）
+
+课程演示要求“5 分钟内可回滚到上一可用版本”，因此发布前必须留三样东西：**数据库快照、上一个 WAR、Git Tag**。
+
+**1、发布前留档（约 2 分钟）**
+
+```bash
+# ① 数据库快照：结构 + 数据全量，带时间戳
+mysqldump -ucampus_loop -p \
+  --single-transaction --routines --triggers \
+  --default-character-set=utf8mb4 \
+  campus_loop > /opt/tomcat/backup/campus_loop_$(date +%Y%m%d_%H%M).sql
+
+# ② 当前 WAR 另存为上一个版本
+cp /opt/tomcat/webapps/campus-loop.war \
+   /opt/tomcat/backup/campus-loop_$(date +%Y%m%d_%H%M).war
+
+# ③ 打 Git Tag，标记本次发布点
+git tag -a "release-$(date +%Y%m%d-%H%M)" -m "设计阶段联调版本"
+git push origin --tags
+```
+
+**2、回滚步骤（约 3 分钟）**
+
+| 步 | 操作 | 命令 | 耗时 |
+| --- | --- | --- | --- |
+| 1 | 停应用 | `systemctl stop tomcat`（或 `shutdown.sh`） | 20s |
+| 2 | 还原数据库 | `mysql -ucampus_loop -p campus_loop < /opt/tomcat/backup/campus_loop_20261121_1530.sql` | 60–90s |
+| 3 | 换回 WAR | `cp /opt/tomcat/backup/campus-loop_20261121_1500.war /opt/tomcat/webapps/campus-loop.war` | 5s |
+| 4 | 清理解压目录 | `rm -rf /opt/tomcat/webapps/campus-loop/` | 5s |
+| 5 | 启应用 | `systemctl start tomcat`，`tail -f logs/catalina.out` 看到 `Server startup in xxx ms` | 30–60s |
+| 6 | 冒烟验证 | 登录 + 打开首页推荐 + 查一条流转单详情 | 30s |
+
+**3、回滚的三条红线**
+
+1、**只回滚代码、不回滚数据**适用于“新代码有 bug 但数据未污染”；一旦新版本已写入错误数据（如状态机错乱），必须连同快照一起回滚，否则旧代码读到新数据会二次报错。
+
+2、**结构变更不可逆**：若新版本执行了 `ALTER TABLE`（如加列），回滚 SQL 快照会丢失新列数据。因此设计阶段约定——**联调期间禁止直接改线上表结构**，DDL 变更必须走“先改 `schema.sql` + 重建 + 重新灌 `data.sql`”的路径，并在 Git Tag 中记录。
+
+3、**上传文件不回滚**：`upload/` 与 `certificate/` 是增量数据，回滚数据库会使部分文件失去引用，但**不得删除文件**——孤儿文件由定时清理任务在 30 天后处理，人工删会误伤仍在引用的图片。
+
+**4、版本与镜像留存策略**
+
+| 留存对象 | 数量 | 位置 | 清理方式 |
+| --- | --- | --- | --- |
+| SQL 快照 | 最近 5 份 | `/opt/tomcat/backup/` | 超出按时间删除最旧 |
+| WAR 包 | 最近 3 个版本 | 同上 | 同上 |
+| Git Tag | 每个发布点 1 个 | 远端仓库 | 不删除（审计需要） |

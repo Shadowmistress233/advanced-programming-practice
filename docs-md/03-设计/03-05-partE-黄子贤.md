@@ -98,19 +98,30 @@
 ## （十三）个人中心与信用档案（模块 13）
 
 ### 1、类与职责
-（覆盖 `UserProfileController`、`UserProfileService`、`ProfileUpdateDTO`、`PasswordUpdateDTO`、`UserProfileVO`）
+`UserProfileController` 从 Session 取得本人 ID，校验请求并封装公共响应。`UserProfileService` 读取个人与信用资料、更新准许维护的字段、校验并更换密码。`ProfileUpdateDTO` 只绑定 campus 和 college；`PasswordUpdateDTO` 接收原密码、新密码和确认值。`UserProfileVO` 按展示字段组装个人名片、认证状态、信用等级和评价标签。
 
 ### 2、方法设计
-（对应 `GET /api/users/me`、`POST /api/users/me/profile`、`POST /api/users/me/password`）
+| 本人接口 | 服务方法 | 成功响应 |
+| --- | --- | --- |
+| `GET /api/users/me` | `getProfile(Integer userId)`，无客户端参数 | `Result<UserProfileVO>` |
+| `POST /api/users/me/profile` | `updateProfile(Integer userId, ProfileUpdateDTO dto)`，接收 campus、college | `Result<UserProfileVO>`，返回更新后的资料 |
+| `POST /api/users/me/password` | `updatePassword(Integer userId, PasswordUpdateDTO dto)`，接收 oldPassword、newPassword、confirmPassword | 公共响应 code=0，data 为 null |
 
 ### 3、处理流程
-（查询个人资料脱敏去密码；更新仅放行 `campus`/`college` 锁定学号与认证态；改密 BCrypt 比对原密码后以新哈希更新并保留会话）
+1. 查看。认证拦截器核验会话及账号状态后，服务按本人 ID 查询展示字段和信用概览，将敏感标识脱敏后返回。个人中心 [UI-19] 的名片链接至信用档案 [UI-14]。切换“我的发布、我的流转、我的捐赠、我的技能”时按本人身份分别分页加载；个人资料响应只返回概览。
+2. 编辑。服务校验提交的校区、学院，仅更新本次提交且合法的可写字段，更新条件绑定会话用户 ID。提交成功后重新读取资料生成响应；若校区变更，同步当前 Session 中的校区，以便后续页面读取新值。
+3. 改密。页面提示密码强度与两次输入是否一致，服务端独立校验。事务内按本人 ID 锁定账号行，以 BCrypt 比对原密码与当前哈希；匹配后为新密码生成 BCrypt 哈希并更新。并发请求依次校验最新哈希，改密成功后保留当前会话。
 
 ### 4、关键规则
-（响应绝不返回 `password`、只读身份字段服务端白名单忽略非法提交）
+资料页将学号、姓名和认证状态设为只读。服务端忽略请求夹带的身份、信用和只读字段。例如同时提交有效的新学院和另一学号时，只更新学院，回读的学号保持原值。所有响应均排除 password 及其哈希；改密操作的日志只记录操作结果，禁止记录请求体中的密码或确认值。
 
 ### 5、异常分支
-（写明错误码 `1001`/`1002`/`1005`/`2303` 及提示语）
+| 错误码与提示 | 触发条件与处理 |
+| --- | --- |
+| 1001 参数错误 | 可写字段值非法、密码参数缺失、新密码强度不合规或两次输入不一致；提示修正相应输入，本次不写入。 |
+| 1002 未登录 | 会话缺失或已过期，提示重新登录。 |
+| 1005 账号已停用 | 拦截器复核到账号停用，销毁旧会话并终止请求。 |
+| 2303 原密码错误 | BCrypt 比对失败，保留原密码哈希并提示重新输入原密码。 |
 
 ## （十四）操作日志审计（模块 14）
 

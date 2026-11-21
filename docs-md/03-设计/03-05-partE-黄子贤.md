@@ -15,19 +15,26 @@
 ## （十）站内消息与通知（模块 10）
 
 ### 1、类与职责
-（覆盖 `MessageController`、`MessageService`、`MessageServiceImpl`、`NotifyMapper`、`NotifyTemplateEnum`、`NotifyVO`）
+`MessageController` 从 Session 获取当前用户 ID，校验请求参数，以公共 `Result<T>` 返回结果。`MessageService` 定义查询、标记已读、统计和模板发送方法；`MessageServiceImpl` 实现归属校验、事务控制和模板渲染。`NotifyMapper` 读写 MySQL 的 `notify` 表。`NotifyTemplateEnum` 为每种业务事件定义通知类型、标题、正文和必填占位符。`NotifyVO` 对外提供 id、title、content、notifyType、isRead、createTime。
 
 ### 2、方法设计
-（对应 `GET /api/messages`、`POST /api/messages/read`、`GET /api/messages/unread-count` 及供业务模块单向调用的模板发送方法）
+| 入口 | Service 方法 | 输入与返回 |
+| --- | --- | --- |
+| `GET /api/messages` | `list(Integer userId, String notifyType, Integer isRead, Integer page, Integer pageSize)` | 两个筛选条件均可省略；返回 `PageInfo<NotifyVO>`。 |
+| `POST /api/messages/read` | `markRead(Integer userId, Integer notifyId, Boolean all)` | 单条模式提供正整数 notifyId；全部模式仅传 all=true。返回含 unreadCount 的对象。 |
+| `GET /api/messages/unread-count` | `countUnread(Integer userId)` | 无客户端入参；返回含 unreadCount 的对象。 |
+| 业务模块内部调用 | `send(Integer recipientId, NotifyTemplateEnum template, Map<String,String> arguments)` | 调用方提供接收人和模板参数，无返回值；本模块不反向调用业务模块。 |
 
 ### 3、处理流程
-（模板占位符渲染 → 异步或独立异常捕获写入 `notify`；按类型筛选分页；单条/全部标为已读并校验归属）
+1. 生成通知。业务事务提交成功后，按模板检查必填参数，渲染标题与正文，独立事务写入接收人、类型和未读状态。业务事务回滚时跳过发送。标题最多 100 字符，正文最多 500 字符。
+2. 分页查询。以 `user_id = 当前用户` 为固定条件，再追加类型和阅读态筛选。`PageHelper.startPage` 后立即执行查询，按 create_time、id 双降序排列。页码默认 1，每页默认 12 条，上限 50。
+3. 标记已读。单条模式在事务内按 id 和 user_id 查询归属，再以相同条件和 `is_read=0` 更新为 1；本人已读消息直接成功。全部模式仅更新当前用户的未读行。两种模式均在更新后统计当前用户剩余未读数并返回。
 
 ### 4、关键规则
-（消息写入失败仅记日志不回滚主业务、30 秒轻量轮询未读数）
+类型限定为 order、audit、credit、system；阅读态 0 表示未读，1 表示已读。未读统计按 `user_id` 和 `is_read=0` 计数，复用索引 `idx_notify_user`。顶部红点每 30 秒请求一次统计接口，直接显示服务端返回值。重复或并发标记同一条消息只改变一次状态：起初有 3 条未读且期间无新消息时，连续两次标记同一条后均返回 2。
 
 ### 5、异常分支
-（写明错误码 `1002`/`1003`/`1005` 及提示语）
+公共拦截器在三个接口执行前校验身份。Session 缺失或过期返回 `1002`「未登录」；已登录用户被停用时销毁旧 Session，返回 `1005`「账号已停用」。单条标记找不到属于当前用户的目标时统一返回 `1003`「无权限」，避免暴露他人消息是否存在。筛选值非法或标记模式参数矛盾时按公共参数校验返回 `1001`，不执行更新。模板参数缺失、渲染超长或通知写入失败时记录模板、接收人 ID 与失败原因，不记录消息正文，不回滚已提交的主业务。
 
 ## （十一）统计分析与数据看板（模块 11）
 

@@ -39,19 +39,28 @@
 ## （十一）统计分析与数据看板（模块 11）
 
 ### 1、类与职责
-（覆盖 `DashboardController`、`DashboardService`、`StatDailyMapper`、`StatDailyTask`、`DashboardVO`、`StatDailyVO`）
+`DashboardController` 接收管理员查询和导出请求，校验校区、起止日期，分别返回公共响应或文件流。`DashboardService` 统一计算指标，供页面和导出复用。`StatDailyMapper` 读写日统计并查询分类分布；`StatDailyTask` 每日汇总前一自然日，支持指定日期重算。`StatDailyVO` 表示一个日期、一个校区的指标；`DashboardVO` 包含区间 KPI、逐日趋势、分类占比、双模式占比及漏斗四个阶段的数量。
 
 ### 2、方法设计
-（对应 `GET /api/admin/dashboard`、`GET /api/admin/dashboard/export` 及每日预聚合定时任务）
+| 入口 | 方法与结果 |
+| --- | --- |
+| `GET /api/admin/dashboard` | `query(String campus, LocalDate startDate, LocalDate endDate)` 返回 `DashboardVO`，控制器封装为 `Result<DashboardVO>`。 |
+| `GET /api/admin/dashboard/export` | `export(String campus, LocalDate startDate, LocalDate endDate, OutputStream out)` 使用同一查询口径，通过 Apache POI 写出 .xlsx 文件流。 |
+| 每日定时任务 | `aggregate(LocalDate statDate)` 对指定自然日分别生成各校区及全校统计，按日期和校区唯一键写入。 |
 
 ### 3、处理流程
-（定时任务按天×校区统计并 `INSERT ... ON DUPLICATE KEY UPDATE` 写入 `stat_daily`；看板按区间查预聚合表拼装 KPI/趋势/占比/漏斗；Apache POI 流式导出 Excel）
+1. 日汇总。从统计日零点取到次日零点之前。发布按物品发布时间计数，流转意向按发起时间计数，交换和寄售按同批流转单的 trade_mode 分组；成交按核销完成时间计数，捐赠按审核通过时间计数。流转单按目标物品归属校区统计。违约归入实际转为违约的日期，浏览归入访问发生日期。
+2. 写入。按 `uk_date_campus(stat_date,campus)` 执行 `INSERT ... ON DUPLICATE KEY UPDATE`，将可重算指标覆盖为本次计算值。全校行使用 `campus='ALL'`。查询全校时仅取 ALL 行；查询单校区时只取该校区。
+3. 展示。按含首尾两天的日期区间读取日表，累计发布、成交、审核通过捐赠及违约数，按日期输出发布和成交趋势。分类占比另查同期同校区发布物品，按 category_id 分组并除以发布总数。交换与寄售分别除以两种模式单数之和。漏斗依次展示 publish_count、view_count、order_count、finish_count 的区间合计；浏览单位为次，意向和成交单位为单，属于期间业务量。
+4. 导出。以相同筛选参数获取看板结果，将校区、日期范围、指标和逐日明细写入工作簿。使用 Apache POI 的 SXSSFWorkbook 分批写行并释放临时文件；下载文件名包含校区和日期范围。
 
 ### 4、关键规则
-（违约率口径、预聚合幂等重跑、空数据安全返回 0、Plan B 裁剪说明）
+区间违约率取 `SUM(default_count) / SUM(order_count)`，以百分比展示。两天分别有 1/2、0/8 笔违约时，区间结果为 10%。分母为零时比率返回 0；已完成汇总且无业务的日期返回零值，页面展示统一空态。
+
+日指标重跑必须能追溯到统计日。现有物品 view_count 只保存累计次数，订单当前状态也不能确定实际转为违约的日期。建议由浏览处理和违约状态转换在业务写入成功时，于同一事务按日期更新校区行及 ALL 行的对应计数；违约仅在条件更新成功一次时计入。采用此方案时，日任务仅覆盖可从业务明细重算的列，保留已累积的 view_count、default_count，避免重跑清零或重复累加。此写入约定需与对应模块负责人对齐；缺少采集记录的历史区间不能作为零业务验收。立项 Plan B 启用时可暂缓本模块，看板与导出均独立于流转主流程。
 
 ### 5、异常分支
-（写明错误码 `1002`/`1003`/`5001` 及提示语）
+两个接口均先校验管理员身份：会话缺失或过期返回 `1002`「未登录」，角色不符返回 `1003`「无权限」。导出生成失败且响应尚未提交时返回 `5001`「系统异常」；若文件流已开始发送，则终止下载并记录失败，避免将 JSON 拼入工作簿。日任务失败时回滚本次事务并记录日期与校区，修复后按原统计日重跑。
 
 ## （十二）后台审核与违规处置（模块 12）
 

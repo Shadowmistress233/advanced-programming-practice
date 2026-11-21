@@ -1,160 +1,67 @@
 <script setup>
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
+import { get, post, useLoad, useAction } from '../api'
 import { useRoute, useRouter } from 'vue-router'
-import { itemById, sample } from '../data'
-import { confirmAction } from '../feedback'
-const route = useRoute(),
+import LoadState from '../components/LoadState.vue'
+const id = useRoute().params.id,
   router = useRouter(),
-  target = itemById(route.params.id)
-const options = [6, 7, 9, 1]
-  .filter((id) => id !== target.id)
-  .slice(0, 3)
-  .map((id) => itemById(id))
-const chosen = ref(options[0].id),
+  offer = ref(''),
   message = ref(''),
-  offer = computed(() => itemById(chosen.value))
-function submit() {
-  confirmAction(
-    '提交交换意向',
-    '确认用「' + offer.value.title + '」交换「' + target.title + '」？',
-    () => {
-      sample.order = {
-        targetId: target.id,
-        offerId: chosen.value,
-        message: message.value || '希望和你交换这件闲置，可以约时间面交。',
-        appointment: null,
-        canceled: false,
-      }
-      router.push('/order')
-    },
-    '确认提交',
-  )
+  page = ref(1)
+const state = useLoad(() => get('/items/' + id))
+const offers = useLoad(async () => {
+  if (!state.data.value || state.data.value.tradeMode !== 'exchange') return { list: [] }
+  return get('/items/mine', { status: 1, page: page.value, pageSize: 12 })
+}, [state.data, page])
+const { busy, issue, run } = useAction()
+function changePage(delta) {
+  offer.value = ''
+  page.value += delta
+}
+function send() {
+  run(async () => {
+    const tradeMode = state.data.value.tradeMode
+    const order = await post('/orders', {
+      itemId: Number(id),
+      tradeMode,
+      ...(tradeMode === 'exchange' ? { offerItemId: Number(offer.value) } : {}),
+      message: message.value,
+    })
+    router.push('/order/' + order.orderId)
+  })
 }
 </script>
 <template>
-  <main class="wrap">
-    <div class="breadcrumb">
-      <RouterLink :to="'/item/' + target.id">物品详情</RouterLink> / <b>发起交换</b>
-    </div>
-    <div class="heading">
-      <div>
-        <h1>发起交换</h1>
-        <p class="subtitle">选择一件你名下的在售物品作为交换物，对方同意后双方物品将同时锁定</p>
-      </div>
-    </div>
-    <section class="panel exchange">
-      <div class="exchange-grid">
-        <div>
-          <h3>我用来交换的物品</h3>
-          <p class="small subtitle">只能选择状态为「在售」的物品</p>
-          <button
-            v-for="item in options"
-            class="choice pick"
-            :class="{ selected: chosen === item.id }"
-            @click="chosen = item.id"
-          >
-            <span class="tile mini" :class="item.color">{{ item.label }}</span
-            ><span
-              ><b>{{ item.title }}</b
-              ><small>在售 · {{ item.condition }}</small></span
-            ><strong>{{ chosen === item.id ? '●' : '○' }}</strong></button
-          ><RouterLink class="text" to="/publish">＋ 去发布新的物品</RouterLink>
-        </div>
-        <div class="swap"><span>⇄</span><small>双方同时锁定</small></div>
-        <div>
-          <h3>我想换到的物品</h3>
-          <p class="small subtitle">来自 李同学 · 信用 88</p>
-          <article class="item-card target">
-            <div class="tile card-cover" :class="target.color">{{ target.label }}</div>
-            <div class="card-body">
-              <h3>{{ target.title }}</h3>
-              <div class="actions">
-                <span class="tag mint">{{ target.method }}</span
-                ><span class="tag">{{ target.condition }}</span>
-              </div>
-              <small>希望换到：{{ target.id === 1 ? '英语一真题 / 线性代数教材' : target.price }}</small>
+  <main class="wrap live">
+    <header class="page-title"><h1>发起流转</h1></header>
+    <LoadState :state="state" v-slot="{ data }">
+      <form class="panel editor" @submit.prevent="send">
+        <h2>{{ data.title }}</h2>
+        <p>
+          {{ data.tradeMode === 'exchange' ? '对方想换 · ' + data.expectItem : '寄售价 · ¥' + data.price }}
+        </p>
+        <template v-if="data.tradeMode === 'exchange'">
+          <LoadState :state="offers" v-slot="{ data }">
+            <label class="field">
+              <span>选择我的在售物品</span>
+              <select v-model="offer" required>
+                <option value="" disabled>选择换出物品</option>
+                <option v-for="v in data.list" :value="v.itemId ?? v.id">{{ v.title }}</option>
+              </select>
+            </label>
+            <div v-if="data.pages > 1" class="actions">
+              <button type="button" :disabled="page === 1" @click="changePage(-1)">上一页</button>
+              <button type="button" :disabled="page >= data.pages" @click="changePage(1)">下一页</button>
             </div>
-          </article>
-        </div>
-      </div>
-      <hr />
-      <label class="field"
-        ><b>给对方留言</b
-        ><textarea
-          v-model="message"
-          placeholder="你好，我有数据结构（C 语言版）第 3 版，9 成新无笔记，想换你的考研数学，本部可以面交～"
-        ></textarea>
-      </label>
-      <div class="form-foot">
-        <small
-          >提交后你的物品「{{ offer.title }}」将被锁定，对方确认前可随时取消；<br />对方 48
-          小时未处理，意向自动关闭。</small
-        >
-        <div class="actions">
-          <RouterLink class="btn" :to="'/item/' + target.id">取消</RouterLink
-          ><button class="primary" @click="submit">提交交换意向</button>
-        </div>
-      </div>
-    </section>
+          </LoadState>
+        </template>
+        <label class="field">
+          留言
+          <textarea v-model="message" maxlength="200" />
+        </label>
+        <p v-if="issue" role="alert" class="error">{{ issue }}</p>
+        <button class="primary" :disabled="busy">提交流转意向</button>
+      </form>
+    </LoadState>
   </main>
 </template>
-<style scoped>
-.exchange {
-  padding: 24px;
-}
-.exchange-grid {
-  display: grid;
-  grid-template-columns: 1fr 14% 1fr;
-  align-items: start;
-}
-.pick {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin: 10px 0;
-  padding: 12px;
-}
-.pick strong {
-  margin-left: auto;
-  color: var(--green);
-}
-.swap {
-  align-self: center;
-  text-align: center;
-  display: grid;
-  gap: 8px;
-  justify-items: center;
-}
-.swap span {
-  display: grid;
-  place-items: center;
-  width: 64px;
-  height: 64px;
-  border-radius: 50%;
-  background: var(--pale);
-  color: var(--green);
-  font-size: 28px;
-}
-.target {
-  margin-top: 12px;
-}
-.target .card-cover {
-  height: 150px;
-}
-.target .actions {
-  margin: 8px 0;
-}
-.exchange .form-foot {
-  margin-top: 24px;
-}
-@media (max-width: 760px) {
-  .exchange-grid {
-    grid-template-columns: 1fr;
-    gap: 12px;
-  }
-  .swap {
-    display: none;
-  }
-}
-</style>

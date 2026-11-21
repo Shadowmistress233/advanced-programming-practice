@@ -1,124 +1,66 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import { messages, sample, statusColor } from '../data'
-import { info, notify } from '../feedback'
+import { ref, watch } from 'vue'
+import { get, post, useLoad, useAction, unread, pageOf } from '../api'
+import LoadState from '../components/LoadState.vue'
 import Pager from '../components/Pager.vue'
-const router = useRouter(),
-  tab = ref('全部'),
+const notifyType = ref(''),
+  isRead = ref(''),
   page = ref(1)
-const types = [
-  ['全部', '全部消息'],
-  ['流转', '流转通知'],
-  ['审核', '审核结果'],
-  ['积分', '积分变动'],
-  ['捐赠', '捐赠进展'],
-  ['系统', '系统公告'],
-]
-const list = computed(() => messages.filter((m) => tab.value === '全部' || m.type === tab.value))
-const unread = computed(() => [0, 1].filter((id) => !sample.noticesRead.includes(id)))
-watch(tab, () => (page.value = 1))
-function openMessage(m) {
-  if (unread.value.includes(m.id)) sample.noticesRead.push(m.id)
-  if (m.path) router.push(m.path)
-  else info(m.title, m.body)
-}
-function readAll() {
-  sample.noticesRead = [0, 1]
-  notify('全部消息已标为已读')
+watch([notifyType, isRead], () => (page.value = 1))
+const state = useLoad(
+  () =>
+    get('/messages', { notifyType: notifyType.value, isRead: isRead.value, page: page.value, pageSize: 12 }),
+  [notifyType, isRead, page],
+)
+const { busy, issue, run } = useAction()
+function read(id) {
+  run(async () => {
+    const data = await post('/messages/read', id ? { notifyId: id, all: false } : { all: true })
+    unread.value = data.unreadCount
+    await state.reload()
+  })
 }
 </script>
 <template>
-  <main class="wrap">
-    <div class="heading">
-      <div>
-        <h1>消息中心</h1>
-        <p class="subtitle">未读 {{ unread.length }} 条 · 共 5 类通知</p>
-      </div>
-      <button @click="readAll">全部标为已读</button>
+  <main class="wrap live">
+    <header class="page-title"><h1>通知收件箱</h1></header>
+    <div class="toolbar">
+      <label class="field">
+        <span>通知类型</span>
+        <select v-model="notifyType">
+          <option value="">全部</option>
+          <option value="order">流转</option>
+          <option value="audit">审核</option>
+          <option value="credit">积分</option>
+          <option value="system">系统</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>阅读状态</span>
+        <select v-model="isRead">
+          <option value="0">未读</option>
+          <option value="1">已读</option>
+          <option value="">全部</option>
+        </select>
+      </label>
+      <button :disabled="busy" @click="read()">全部标为已读</button>
     </div>
-    <div class="inbox">
-      <aside class="panel folders">
-        <button
-          v-for="[key, title] in types"
-          class="side-link"
-          :class="{ active: tab === key }"
-          @click="tab = key"
-        >
-          {{ title }}<span v-if="key === '全部' && unread.length" class="tag rose">{{ unread.length }}</span>
-        </button>
-      </aside>
-      <div>
-        <section class="panel flush">
-          <button v-for="m in list.slice((page - 1) * 7, page * 7)" class="message" @click="openMessage(m)">
-            <span class="tag" :class="statusColor(m.type)">{{ m.type }}</span>
-            <div class="grow">
-              <div class="spread">
-                <b><i v-if="unread.includes(m.id)" class="unread"></i>{{ m.title }}</b
-                ><small>{{ m.time }}</small>
-              </div>
-              <small>{{ m.body }}</small>
-            </div>
-          </button>
-        </section>
-        <Pager v-model:page="page" :total="Math.ceil(list.length / 7)" />
-      </div>
-    </div>
+    <p v-if="issue" role="alert" class="error">{{ issue }}</p>
+    <LoadState :state="state" v-slot="{ data }">
+      <article class="ledger-row" v-for="n in data.list">
+        <div>
+          <small>{{ n.createTime }}</small>
+          <h3>{{ n.title }}</h3>
+          <p>{{ n.content }}</p>
+        </div>
+        <button v-if="!n.isRead" :disabled="busy" @click="read(n.notifyId ?? n.id)">标为已读</button>
+        <small v-else>已读</small>
+        <RouterLink v-if="n.notifyType === 'order' && n.refId" :to="'/order/' + n.refId">
+          查看流转单
+        </RouterLink>
+      </article>
+      <p v-if="!data.list?.length" class="empty">暂无通知</p>
+      <Pager v-if="pageOf(data)?.pages > 1" v-model:page="page" :total="pageOf(data).pages" />
+    </LoadState>
   </main>
 </template>
-<style scoped>
-.inbox {
-  display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-.folders {
-  padding: 10px;
-}
-.message {
-  width: 100%;
-  text-align: left;
-  justify-content: flex-start;
-  align-items: flex-start;
-  font-weight: 400;
-  gap: 16px;
-  min-height: 72px;
-  padding: 16px 20px;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  border-radius: 0;
-}
-.message:last-child {
-  border: 0;
-}
-.message small {
-  display: block;
-  margin-top: 4px;
-}
-.message .unread {
-  margin-right: 5px;
-}
-.folders .side-link {
-  margin: 2px 0;
-}
-.message .spread small {
-  white-space: nowrap;
-}
-@media (max-width: 760px) {
-  .inbox {
-    grid-template-columns: 1fr;
-  }
-  .folders {
-    display: flex;
-    flex-wrap: wrap;
-  }
-  .folders .side-link {
-    width: auto;
-  }
-  .message {
-    padding: 12px;
-    gap: 8px;
-  }
-}
-</style>

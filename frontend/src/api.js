@@ -1,13 +1,19 @@
 import { ref, watch, onScopeDispose } from 'vue'
 import { notify } from './feedback'
 import { MOCK_ENABLED, mockData, mockFile } from './mock'
+export {
+  campuses,
+  conditions,
+  itemStates,
+  orderStates,
+  pickupPoints,
+  charityClubs,
+  reportTypes,
+  creditLevelOf,
+} from './constants'
 
 export const user = ref(null)
 export const unread = ref(0)
-export const campuses = ['本部', '新校区', '铁道', '湘雅']
-export const conditions = ['全新', '九成新', '七成新', '可用']
-export const itemStates = ['待审核', '在售', '锁定', '已完成', '已下架']
-export const orderStates = ['待确认', '已确认', '待面交', '已完成', '已取消', '已违约']
 const prefix = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/, '')
 export function mediaUrl(value) {
   if (!value) return ''
@@ -66,13 +72,15 @@ export function useLoad(loader, sources = []) {
   async function reload() {
     const current = ++version
     error.value = ''
-    data.value = null
-    loading.value = true
+    if (data.value == null) loading.value = true
     try {
       const value = await loader()
       if (current === version) data.value = value
     } catch (e) {
-      if (current === version) error.value = e.message
+      if (current === version) {
+        data.value = null
+        error.value = e.message
+      }
     } finally {
       if (current === version) loading.value = false
     }

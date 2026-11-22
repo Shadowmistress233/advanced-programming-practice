@@ -1,10 +1,12 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
+import { BookOpen, Dumbbell, Lamp, Laptop, LayoutGrid, RotateCcw, Search } from '@lucide/vue'
 import { get, useLoad, campuses, conditions, categoryOptions, pageOf } from '../api'
 import { useRoute, useRouter } from 'vue-router'
 import LoadState from '../components/LoadState.vue'
 import ItemCard from '../components/ItemCard.vue'
 import Pager from '../components/Pager.vue'
+
 const route = useRoute(),
   router = useRouter(),
   page = ref(Number(route.query.page) || 1)
@@ -21,17 +23,38 @@ const defaults = {
 const filters = reactive(
   Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, route.query[k] ?? v])),
 )
+
+watch(
+  () => route.query,
+  (q) => {
+    for (const [k, v] of Object.entries(defaults)) filters[k] = q[k] ?? v
+    page.value = Number(q.page) || 1
+  },
+)
+
 const categories = useLoad(() => get('/categories/tree'))
 const results = useLoad(
   () => get('/items', { ...route.query, page: page.value, pageSize: 12 }),
   [() => route.query, page],
 )
+
+const categoryIcon = {
+  教材书籍: BookOpen,
+  数码电子: Laptop,
+  生活用品: Lamp,
+  运动器材: Dumbbell,
+}
+
+function selectCategory(catId) {
+  filters.categoryId = catId === '' ? '' : String(catId)
+  apply()
+}
 function reset() {
   Object.assign(filters, defaults)
   apply()
 }
 function apply() {
-  router.push({
+  router.replace({
     path: '/search',
     query: Object.fromEntries(Object.entries({ ...filters, page: 1 }).filter(([, v]) => v !== '')),
   })
@@ -42,17 +65,42 @@ function setPage(p) {
 </script>
 <template>
   <main class="wrap live">
-    <header class="page-title"><h1>闲置检索</h1></header>
+    <header class="page-title">
+      <h1>闲置检索</h1>
+      <small>关键词与多条件组合筛选，每页 12 条稳定分页</small>
+    </header>
+
+    <nav v-if="categories.data.value?.length" class="category-index" aria-label="快捷分类筛选">
+      <button
+        type="button"
+        :class="{ active: !filters.categoryId }"
+        @click="selectCategory('')"
+      >
+        <LayoutGrid :size="14" :stroke-width="1.8" />
+        <span>全部</span>
+      </button>
+      <button
+        v-for="c in categories.data.value"
+        :key="c.id"
+        type="button"
+        :class="{ active: Number(filters.categoryId) === Number(c.id) }"
+        @click="selectCategory(c.id)"
+      >
+        <component :is="categoryIcon[c.categoryName] || BookOpen" :size="14" :stroke-width="1.8" />
+        <span>{{ c.categoryName }}</span>
+      </button>
+    </nav>
+
     <form class="filter-bar panel" @submit.prevent="apply">
       <label class="field">
         <span>关键词</span>
-        <input v-model="filters.keyword" type="search" />
+        <input v-model="filters.keyword" type="search" placeholder="物品名 / 分类 / 关键词" />
       </label>
       <label class="field">
         <span>分类</span>
         <select v-model="filters.categoryId">
           <option value="">全部分类</option>
-          <option v-for="c in categoryOptions(categories.data.value)" :value="c.id">
+          <option v-for="c in categoryOptions(categories.data.value)" :key="c.id" :value="String(c.id)">
             {{ c.categoryName }}
           </option>
         </select>
@@ -61,14 +109,14 @@ function setPage(p) {
         <span>校区</span>
         <select v-model="filters.campus">
           <option value="">全部校区</option>
-          <option v-for="c in campuses">{{ c }}</option>
+          <option v-for="c in campuses" :key="c">{{ c }}</option>
         </select>
       </label>
       <label class="field">
         <span>成色</span>
         <select v-model="filters.conditionLevel">
           <option value="">全部成色</option>
-          <option v-for="c in conditions">{{ c }}</option>
+          <option v-for="c in conditions" :key="c">{{ c }}</option>
         </select>
       </label>
       <label class="field">
@@ -76,7 +124,7 @@ function setPage(p) {
         <select v-model="filters.tradeMode">
           <option value="">不限</option>
           <option value="exchange">以物易物</option>
-          <option value="consign">寄售</option>
+          <option value="consign">低价寄售</option>
         </select>
       </label>
       <label class="field">
@@ -97,8 +145,14 @@ function setPage(p) {
         </select>
       </label>
       <div class="actions">
-        <button class="primary">筛选</button>
-        <button type="button" @click="reset">重置</button>
+        <button class="primary">
+          <Search :size="14" :stroke-width="1.9" />
+          <span>筛选</span>
+        </button>
+        <button type="button" @click="reset">
+          <RotateCcw :size="14" :stroke-width="1.8" />
+          <span>重置</span>
+        </button>
       </div>
     </form>
     <p v-if="categories.error.value" class="error">
@@ -106,7 +160,7 @@ function setPage(p) {
       <button @click="categories.reload">重试分类</button>
     </p>
     <LoadState :state="results" v-slot="{ data }">
-      <div class="section-head">
+      <div class="section-head" style="margin: 2px 0 10px">
         <h2>搜索结果</h2>
         <small>共 {{ pageOf(data)?.total ?? 0 }} 件</small>
       </div>
@@ -115,7 +169,7 @@ function setPage(p) {
       </div>
       <div v-if="!pageOf(data)?.list?.length">
         <p class="empty">没有匹配的在售物品</p>
-        <h3 v-if="data.fallbackList?.length">同类热门物品</h3>
+        <h3 v-if="data.fallbackList?.length" style="margin-bottom: 12px">同类热门物品</h3>
         <div class="listing-grid">
           <ItemCard v-for="item in data.fallbackList" :key="item.id ?? item.itemId" :item="item" />
         </div>

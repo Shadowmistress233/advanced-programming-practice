@@ -23,16 +23,13 @@ function login() {
 <template>
   <main class="entry">
     <div class="entry-poster">
-      <span class="brand">校园循环</span>
-      <h1>
-        闲置流转
-        <br />
-        技能互换
-      </h1>
-      <RouterLink to="/home">先逛逛校园交换站 →</RouterLink>
+      <img src="../assets/csu-gate.png" alt="绿树环绕的中南大学校门" width="1266" height="844" />
     </div>
-    <form class="editor panel" @submit.prevent="login">
-      <h1>登录校园循环</h1>
+    <form @submit.prevent="login">
+      <header>
+        <h1>登录校园循环</h1>
+        <p>中南大学 · 闲置流转与技能互换</p>
+      </header>
       <label class="field">
         <span>登录身份</span>
         <select v-model="role">
@@ -58,6 +55,7 @@ function login() {
       </label>
       <p v-if="issue" role="alert" class="error">{{ issue }}</p>
       <button class="primary" :disabled="busy">登录</button>
+      <RouterLink to="/home">先逛逛校园交换站 →</RouterLink>
     </form>
   </main>
 </template>

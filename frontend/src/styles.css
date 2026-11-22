@@ -955,8 +955,7 @@ h1,
 .page-title h1 {
   font-size: clamp(26px, 3.6vw, 43px);
 }
-.station,
-.entry-poster {
+.station {
   background: repeating-linear-gradient(120deg, transparent 0 53px, #ffffff0c 53px 54px), #303e82;
   color: #fff9e7;
   border-radius: 6px;
@@ -969,8 +968,7 @@ h1,
   align-items: end;
   justify-content: space-between;
 }
-.station h1,
-.entry-poster h1 {
+.station h1 {
   font-size: clamp(32px, 4.2vw, 68px);
 }
 .station .primary {
@@ -986,26 +984,69 @@ h1,
   color: #e0dfef;
 }
 .entry {
+  --entry-surface: #f8f7f3;
   min-height: 100vh;
+  min-height: 100svh;
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
-  align-items: center;
-  padding: clamp(24px, 7vw, 100px);
-  gap: clamp(30px, 7vw, 120px);
+  grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr);
+  background: var(--entry-surface);
 }
 .entry-poster {
-  min-height: 65vh;
-  display: flex;
-  flex-direction: column;
-  align-items: start;
-  justify-content: space-between;
+  position: relative;
 }
-.entry-poster a {
-  color: #ffde9e;
+.entry-poster img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 50% 38%;
+  mask-image: linear-gradient(to right, black 68%, transparent 100%);
 }
 .entry form {
-  width: 100%;
-  max-width: 460px;
+  place-self: center;
+  display: grid;
+  gap: 20px;
+  width: min(360px, 84%);
+  margin-block: 32px;
+}
+.entry form h1 {
+  font-size: clamp(28px, 3vw, 42px);
+}
+.entry form header p {
+  margin: 6px 0 10px;
+  color: var(--muted);
+}
+.entry .field input,
+.entry .field select {
+  padding-inline: 2px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid #868995;
+  border-radius: 0;
+}
+.entry form > a {
+  justify-self: center;
+  color: var(--accent);
+}
+.entry form button {
+  min-height: 44px;
+}
+@media (max-width: 760px), (orientation: portrait) {
+  .entry {
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+  }
+  .entry-poster {
+    height: clamp(170px, 28svh, 350px);
+  }
+  .entry-poster img {
+    mask-image: linear-gradient(to bottom, black 68%, transparent 100%);
+  }
+  .entry form {
+    gap: 14px;
+    margin-block: 12px 28px;
+  }
 }
 .editor {
   display: grid;
@@ -1153,20 +1194,8 @@ h1,
   overflow-wrap: anywhere;
 }
 @media (max-width: 760px) {
-  .entry,
   .feature {
     grid-template-columns: 1fr;
-  }
-  .entry {
-    gap: 22px;
-    align-content: start;
-    padding: 18px;
-  }
-  .entry-poster {
-    min-height: 210px;
-  }
-  .entry form {
-    max-width: none;
   }
   .listing-grid,
   .score-strip,

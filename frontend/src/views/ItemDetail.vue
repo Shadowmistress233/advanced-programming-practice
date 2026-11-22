@@ -30,12 +30,22 @@ function report() {
     <header class="page-title"><h1>物品详情</h1></header>
     <LoadState :state="state" v-slot="{ data }">
       <article class="feature">
-        <section class="panel stack">
-          <small>{{ data.campus }} · {{ data.conditionLevel }} · {{ itemStates[data.status] }}</small>
-          <h1>{{ data.title }}</h1>
-          <h2>{{ data.tradeMode === 'exchange' ? '想换 ' + data.expectItem : '¥' + data.price }}</h2>
-          <p>{{ data.description }}</p>
-          <p v-if="data.tradePlace">建议面交点 · {{ data.tradePlace }}</p>
+        <section class="panel stack item-summary" aria-labelledby="item-title">
+          <header class="spread">
+            <h2 id="item-title">{{ data.title }}</h2>
+            <span class="tag" :class="{ mint: data.status === 1 }">{{ itemStates[data.status] }}</span>
+          </header>
+          <dl class="item-facts">
+            <div class="trade-value full-row">
+              <dt>{{ data.tradeMode === 'exchange' ? '期望交换' : '价格' }}</dt>
+              <dd v-if="data.tradeMode === 'exchange'">{{ data.expectItem || '未填写' }}</dd>
+              <dd v-else>{{ data.price != null ? '¥' + data.price : '未填写' }}</dd>
+            </div>
+            <div><dt>成色</dt><dd>{{ data.conditionLevel || '未填写' }}</dd></div>
+            <div><dt>校区</dt><dd>{{ data.campus || '未填写' }}</dd></div>
+            <div class="full-row"><dt>建议面交点</dt><dd>{{ data.tradePlace || '未填写' }}</dd></div>
+            <div class="full-row"><dt>物品说明</dt><dd class="description">{{ data.description || '暂无说明' }}</dd></div>
+          </dl>
           <div class="actions">
             <RouterLink
               v-if="data.status === 1 && data.ownerId !== user?.userId"
@@ -70,6 +80,21 @@ function report() {
             <button :disabled="busy">提交举报</button>
           </form>
           <p v-if="issue" role="alert" class="error">{{ issue }}</p>
+          <footer class="item-publication">
+            <dl aria-label="发布信息">
+              <div><dt>分类</dt><dd>{{ data.categoryName || '暂无分类' }}</dd></div>
+              <div>
+                <dt>发布人</dt>
+                <dd class="publisher">
+                  <span>{{ data.sellerNickname || '暂无昵称' }}</span>
+                  <span v-if="data.sellerCreditScore != null" class="tag sky">信用分 {{ data.sellerCreditScore }}</span>
+                  <small v-else>信用分暂无记录</small>
+                </dd>
+              </div>
+              <div><dt>发布时间</dt><dd>{{ data.createTime?.replace('T', ' ') || '暂无记录' }}</dd></div>
+              <div><dt>浏览量</dt><dd>{{ data.viewCount != null ? data.viewCount + ' 次' : '暂无记录' }}</dd></div>
+            </dl>
+          </footer>
         </section>
         <div class="gallery panel">
           <img
@@ -88,3 +113,64 @@ function report() {
     </LoadState>
   </main>
 </template>
+
+<style scoped>
+.item-summary {
+  align-self: stretch;
+}
+.item-summary h2 {
+  font-size: clamp(21px, 2vw, 28px);
+}
+.item-summary dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 20px;
+}
+.item-summary dt {
+  color: var(--muted);
+  font-size: 13px;
+}
+.item-summary dd {
+  margin: 2px 0 0;
+}
+.full-row {
+  grid-column: 1 / -1;
+}
+.trade-value {
+  padding: 12px 16px;
+  background: var(--pale);
+  border-radius: var(--radius);
+}
+.trade-value dd {
+  color: var(--accent);
+  font-size: 23px;
+  font-weight: 700;
+}
+.description {
+  white-space: pre-line;
+}
+.item-publication {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.publisher {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+@media (max-width: 480px) {
+  .item-publication dl {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .item-publication dl > div {
+    display: grid;
+    grid-template-columns: 5em minmax(0, 1fr);
+    align-items: baseline;
+  }
+}
+</style>

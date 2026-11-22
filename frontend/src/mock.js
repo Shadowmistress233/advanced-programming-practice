@@ -43,6 +43,23 @@ const accounts = {
 let current = accounts.student
 let signedOut = false
 
+// 演示详情只返回发布人的公开昵称与信用分。
+const itemPublishers = {
+  1: { nickname: '林同学', creditScore: accounts.student.creditScore },
+  2: { nickname: '绿源公益社', creditScore: accounts.club.creditScore },
+  3: { nickname: '运营管理员', creditScore: accounts.admin.creditScore },
+  10: { nickname: '书页', creditScore: 92 },
+  11: { nickname: '树下等风', creditScore: 89 },
+  12: { nickname: '小麦', creditScore: 96 },
+  13: { nickname: '青禾', creditScore: 88 },
+  14: { nickname: '阿远', creditScore: 91 },
+  15: { nickname: '方糖', creditScore: 84 },
+  16: { nickname: '一只扳手', creditScore: 93 },
+  19: { nickname: '南风', creditScore: 90 },
+  20: { nickname: '墨水瓶', creditScore: 95 },
+  21: { nickname: '木棉', creditScore: 87 },
+}
+
 const categories = [
   {
     id: 1,
@@ -400,7 +417,15 @@ export async function mockData(path, method, params = {}) {
   if (/^\/items\/\d+$/.test(path) && method === 'GET') {
     const item = items.find((row) => row.itemId === id(/^\/items\/(\d+)$/))
     if (!item) fail('物品不存在或已下架')
-    return item
+    const publisher = itemPublishers[item.ownerId]
+    const isOwner = !signedOut && sessionStorage.getItem('campus-session') && item.ownerId === current.userId
+    if (item.status === 1 && !isOwner) item.viewCount = (item.viewCount ?? 0) + 1
+    return {
+      ...item,
+      sellerNickname: publisher?.nickname,
+      sellerCreditScore: publisher?.creditScore,
+      viewCount: item.viewCount ?? 0,
+    }
   }
   if (/^\/items\/\d+\/favorite$/.test(path) && method === 'POST') {
     const item = items.find((row) => row.itemId === id(/^\/items\/(\d+)\/favorite$/))

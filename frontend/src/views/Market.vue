@@ -1,204 +1,169 @@
 <script setup>
-import { computed, ref } from 'vue'
-import { itemById, priceText, sample } from '../data'
-import { info, confirmAction, notify } from '../feedback'
-const events = [
-  ['毕业季甩卖专场', '即将开始', '报名中', '10-28 09:00–17:00', '本部南校区广场', 128, 200, 'green'],
-  ['教材漂流周', '进行中', '进行中', '10-20 – 10-27', '图书馆一楼大厅', 86, 120, 'blue'],
-  ['以物换物集市', '报名中', '报名中', '11-02 14:00–18:00', '铁道校区操场', 42, 150, 'amber'],
-  ['秋日旧书交换', '已结束', '已结束', '10-12 14:00–17:00', '本部图书馆', 60, 80, 'slate'],
-  ['宿舍好物分享', '已结束', '已结束', '10-08 09:00–12:00', '湘雅广场', 43, 60, 'teal'],
-  ['开学季闲置集', '已结束', '已结束', '09-15 09:00–17:00', '校本部广场', 92, 100, 'purple'],
-]
-const tab = ref('全部'),
-  all = ref(false)
-const filtered = computed(() =>
-  tab.value === '全部' ? (all.value ? events : events.slice(0, 3)) : events.filter((e) => e[2] === tab.value),
+import { ref, reactive, watch, computed } from 'vue'
+import { get, post, useLoad, useAction, user, campuses, pageOf } from '../api'
+import { useRoute, useRouter } from 'vue-router'
+import LoadState from '../components/LoadState.vue'
+import { notify } from '../feedback'
+import Pager from '../components/Pager.vue'
+import ItemCard from '../components/ItemCard.vue'
+const id = useRoute().params.id,
+  router = useRouter(),
+  page = ref(1),
+  campus = ref(''),
+  status = ref(''),
+  edit = ref(false),
+  joined = ref(null)
+const manager = computed(() => ['club', 'admin'].includes(user.value?.role))
+watch([campus, status], () => (page.value = 1))
+const state = useLoad(
+  () =>
+    id
+      ? get('/activities/' + id)
+      : get('/activities', { campus: campus.value, status: status.value, page: page.value, pageSize: 12 }),
+  [page, campus, status],
 )
-const registered = (title) => sample.registrations.includes(title)
-const count = (e) => e[5] + Number(registered(e[0]))
-function join(e) {
-  confirmAction(
-    '报名活动',
-    e[0] + ' · ' + e[3] + ' · ' + e[4],
-    () => {
-      sample.registrations.push(e[0])
-      notify('已加入本次演示报名名单')
-    },
-    '确认报名',
-  )
+const form = reactive({
+  title: '',
+  campus: '',
+  location: '',
+  startTime: '',
+  endTime: '',
+  quota: 1,
+  status: 1,
+})
+function open() {
+  if (id) {
+    for (const k in form) form[k] = state.data.value[k]
+    for (const k of ['startTime', 'endTime']) form[k] = form[k]?.replace(' ', 'T').slice(0, 16)
+  }
+  edit.value = true
 }
-const featured = [10, 11, 12, 13].map((id) => itemById(id))
-function toggleAll() {
-  all.value = !all.value
-  tab.value = '全部'
+const { busy, issue, run } = useAction()
+function save() {
+  run(async () => {
+    const data = await post('/activities', {
+      ...form,
+      ...(id ? { activityId: Number(id) } : {}),
+      status: Number(form.status),
+      quota: Number(form.quota),
+      startTime: form.startTime.replace('T', ' ') + ':00',
+      endTime: form.endTime.replace('T', ' ') + ':00',
+    })
+    edit.value = false
+    if (id) await state.reload()
+    else router.push('/market/' + data.activityId)
+  })
+}
+function join() {
+  run(async () => {
+    joined.value = await post('/activities/' + id + '/join')
+    await state.reload()
+    notify('报名成功')
+  })
 }
 </script>
 <template>
-  <main class="wrap">
-    <section class="market-hero spread">
-      <div>
-        <small>换物集市 · 主题活动</small>
-        <h1>毕业季甩卖专场</h1>
-        <p>10 月 28 日 09:00 · 本部南校区广场 · 200 个名额</p>
-        <div class="actions">
-          <button :disabled="registered(events[0][0])" @click="join(events[0])">
-            {{ registered(events[0][0]) ? '已报名' : '立即报名' }}</button
-          ><button
-            class="outline"
-            @click="
-              info(
-                events[0][0],
-                '10 月 28 日 09:00–17:00，在本部南校区广场展示和交换毕业季闲置。活动限额 200 人。',
-              )
-            "
-          >
-            查看详情
-          </button>
-        </div>
-      </div>
-      <div class="capacity">
-        <small>剩余名额</small><b>{{ 200 - count(events[0]) }}</b
-        ><small>已报名 {{ count(events[0]) }} / 200</small>
-      </div>
-    </section>
-    <div class="section-head">
-      <h2>全部活动</h2>
-      <button
-        class="plain muted"
-        @click="toggleAll()"
-      >
-        共 6 场 · {{ all ? '收起' : '按开始时间排序' }}
-      </button>
-      <div class="actions last">
-        <button
-          v-for="t in ['全部', '报名中', '进行中', '已结束']"
-          class="chip"
-          :class="{ chosen: tab === t }"
-          @click="tab = t"
-        >
-          {{ t }}
-        </button>
-      </div>
+  <main class="wrap live">
+    <header class="page-title"><h1>校园主题集市</h1></header>
+    <div v-if="!id" class="toolbar">
+      <label class="field">
+        <span>举办校区</span>
+        <select v-model="campus">
+          <option value="">全部</option>
+          <option v-for="c in campuses">{{ c }}</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>活动状态</span>
+        <select v-model="status">
+          <option value="1">报名中</option>
+          <option value="2">进行中</option>
+          <option value="3">已结束</option>
+          <option value="">全部</option>
+        </select>
+      </label>
+      <button v-if="manager" @click="open">新建活动</button>
     </div>
-    <div class="three">
-      <article v-for="e in filtered" class="item-card">
-        <div class="tile event-cover" :class="e[7]">{{ e[1] }}</div>
-        <div class="event-body">
-          <h3>{{ e[0] }}</h3>
-          <p class="small subtitle">{{ e[3] }} · {{ e[4] }}</p>
-          <div class="bar"><i :style="{ width: (100 * count(e)) / e[6] + '%' }"></i></div>
-          <div class="spread small">
-            已报名 {{ count(e) }}/{{ e[6] }}<span>{{ Math.floor((100 * count(e)) / e[6]) }}%</span>
+    <LoadState :state="state" v-slot="{ data }">
+      <template v-if="id">
+        <header class="station">
+          <div>
+            <small>{{ data.campus }} · {{ data.location }}</small>
+            <h1>{{ data.title }}</h1>
+            <p>{{ data.startTime }} — {{ data.endTime }}</p>
           </div>
-          <div class="spread event-actions">
-            <span class="tag mint">{{ e[2] }}</span
-            ><button class="primary chip" :disabled="registered(e[0]) || e[2] === '已结束'" @click="join(e)">
-              {{ registered(e[0]) ? '已报名' : e[2] === '已结束' ? '已结束' : '立即报名' }}
+          <div>
+            <h2>剩余 {{ joined?.remainQuota ?? data.remainQuota }} 名</h2>
+            <button v-if="manager && (user.role === 'admin' || data.creatorId === user.userId)" @click="open">
+              编辑活动
             </button>
+            <button
+              v-else-if="user?.role === 'student'"
+              :disabled="busy || !!joined || data.joined || data.status !== 1 || data.remainQuota <= 0"
+              @click="join"
+            >
+              {{ joined || data.joined ? '已报名' : '报名参加' }}
+            </button>
+            <p v-if="joined">报名号 {{ joined.joinNo }}</p>
           </div>
+        </header>
+        <p>{{ data.description }}</p>
+        <h2>活动专区物品</h2>
+        <div class="listing-grid">
+          <ItemCard v-for="item in data.items || data.itemList" :key="item.id ?? item.itemId" :item="item" />
         </div>
-      </article>
-    </div>
-    <div class="section-head">
-      <h2>活动专区</h2>
-      <span class="muted">已打上「毕业季」标识的物品</span
-      ><RouterLink to="/search?event=graduation" class="last muted"
-        >查看全部 {{ featured.length }} 件 ›</RouterLink
-      >
-    </div>
-    <div class="cards">
-      <RouterLink class="item-card" v-for="(item, i) in featured" :to="'/item/' + item.id"
-        ><div class="tile card-cover" :class="item.color">{{ item.label }}</div>
-        <div class="card-body">
-          <b>{{ item.title }}</b>
-          <div class="spread">
-            <b class="positive">{{ priceText(item) }}</b
-            ><span class="tag">{{ ['9成新', '以物易物', '8成新', '3 天'][i] }}</span>
-          </div>
-        </div></RouterLink
-      >
-    </div>
+      </template>
+      <template v-else>
+        <div class="bulletins">
+          <RouterLink class="panel bulletin" v-for="a in data.list" :to="'/market/' + (a.activityId ?? a.id)">
+            <small>{{ a.campus }} · {{ a.startTime }}</small>
+            <h2>{{ a.title }}</h2>
+            <p>{{ a.location }} · 余 {{ a.remainQuota }} 名</p>
+          </RouterLink>
+        </div>
+        <p v-if="!data.list?.length" class="empty">暂无活动</p>
+        <Pager v-if="pageOf(data)?.pages > 1" v-model:page="page" :total="pageOf(data).pages" />
+      </template>
+    </LoadState>
+    <form v-if="edit" class="editor panel" @submit.prevent="save">
+      <h2>活动设置</h2>
+      <label class="field">
+        <span>名称</span>
+        <input v-model="form.title" required maxlength="100" />
+      </label>
+      <label class="field">
+        <span>校区</span>
+        <select v-model="form.campus" required>
+          <option v-for="c in campuses">{{ c }}</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>地点</span>
+        <input v-model="form.location" required />
+      </label>
+      <label class="field">
+        <span>开始时间</span>
+        <input v-model="form.startTime" type="datetime-local" required />
+      </label>
+      <label class="field">
+        <span>结束时间</span>
+        <input v-model="form.endTime" type="datetime-local" :min="form.startTime" required />
+      </label>
+      <label class="field">
+        <span>名额</span>
+        <input v-model="form.quota" type="number" min="1" required />
+      </label>
+      <label class="field">
+        <span>状态</span>
+        <select v-model="form.status">
+          <option value="0">草稿</option>
+          <option value="1">报名中</option>
+          <option value="2">进行中</option>
+          <option value="3">已结束</option>
+        </select>
+      </label>
+      <button class="primary" :disabled="busy">保存活动</button>
+    </form>
+    <p v-if="issue" role="alert" class="error">{{ issue }}</p>
   </main>
 </template>
-<style scoped>
-.wrap {
-  padding-top: 20px;
-}
-.market-hero {
-  border-radius: 16px;
-  background: linear-gradient(110deg, #0f866b, #0c6956);
-  color: white;
-  padding: 20px 30px;
-}
-.market-hero small {
-  color: #dbf0e7;
-}
-.market-hero h1 {
-  font-size: 32px;
-  margin: 5px 0;
-}
-.market-hero .actions {
-  margin-top: 14px;
-}
-.market-hero button {
-  height: 46px;
-  color: var(--green);
-}
-.market-hero .outline {
-  color: white;
-  border-color: #ffffff55;
-  background: transparent;
-}
-.capacity {
-  text-align: right;
-}
-.capacity b {
-  display: block;
-  font-size: 44px;
-  line-height: 1.2;
-}
-.section-head {
-  margin-top: 22px;
-}
-.event-cover {
-  height: 104px;
-  border-radius: 0;
-  font-size: 18px;
-}
-.event-body {
-  padding: 12px 16px;
-}
-.bar {
-  height: 8px;
-  background: #f2f3f5;
-  border-radius: 5px;
-  margin: 10px 0 6px;
-}
-.bar i {
-  display: block;
-  background: var(--green);
-  height: 100%;
-  border-radius: 5px;
-}
-.event-actions {
-  margin-top: 10px;
-}
-.card-body .spread {
-  margin-top: 10px;
-}
-.cards .card-cover {
-  height: 120px;
-}
-@media (max-width: 480px) {
-  .market-hero {
-    padding: 18px;
-  }
-  .market-hero h1 {
-    font-size: 24px;
-  }
-  .capacity b {
-    font-size: 30px;
-  }
-}
-</style>

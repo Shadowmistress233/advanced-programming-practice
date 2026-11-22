@@ -36,8 +36,8 @@ function update() {
         symbol: 'circle',
         symbolSize: 7,
         lineStyle: { width: 2.5 },
-        itemStyle: { color: '#0f8a6a' },
-        areaStyle: { color: 'rgba(15,138,106,.12)' },
+        itemStyle: { color: '#334bb5' },
+        areaStyle: { color: 'rgba(51,75,181,.13)' },
       },
       {
         name: '成交',

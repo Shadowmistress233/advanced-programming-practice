@@ -1,66 +1,35 @@
 <script setup>
-import { computed } from 'vue'
-import { useRoute } from 'vue-router'
-import { info } from '../feedback'
-const route = useRoute(),
-  club = computed(() => route.path === '/club')
-const groups = computed(() =>
-  club.value
-    ? [
-        [
-          '捐赠管理',
-          [
-            ['待审核捐赠', '/club', '3'],
-            ['捐赠台账', ''],
-            ['凭证管理', '/certificate'],
-          ],
-        ],
-        [
-          '社团事务',
-          [
-            ['物资去向公示', ''],
-            ['活动报名', '/market'],
-            ['统计报表', ''],
-          ],
-        ],
-      ]
-    : [
-        [
-          '运营',
-          [
-            ['数据看板', '/admin'],
-            ['物品审核', '/admin/review', '12'],
-            ['举报处理', '', '3'],
-          ],
-        ],
-        [
-          '配置',
-          [
-            ['分类与字典', ''],
-            ['积分规则', ''],
-            ['活动管理', '/market'],
-          ],
-        ],
-        ['安全', [['操作日志', '']]],
-      ],
-)
+import { user } from '../api'
 </script>
 <template>
   <aside class="worknav">
-    <RouterLink class="brand" to="/login" title="返回角色选择"
-      ><span class="logo">{{ club ? '爱' : '管' }}</span
-      >{{ club ? '爱心社 · 工作台' : '平台管理台' }}</RouterLink
-    >
-    <section v-for="[title, links] in groups" :key="title">
-      <small>{{ title }}</small>
-      <template v-for="[label, url, count] in links" :key="label">
-        <RouterLink v-if="url" :to="url" class="side-link" :class="{ active: route.path === url }"
-          >{{ label }}<span v-if="count" class="tag rose">{{ count }}</span></RouterLink
-        >
-        <button v-else class="side-link" @click="info(label, '当前设计稿仅展示此菜单入口。')">
-          {{ label }}<span v-if="count" class="tag gold">{{ count }}</span>
-        </button>
-      </template>
+    <RouterLink class="brand" to="/home">
+      <span class="logo">循</span>
+      校园工作台
+    </RouterLink>
+    <section v-if="user?.role === 'admin'">
+      <small>运营管理</small>
+      <RouterLink
+        v-for="[url, label] in [
+          ['/admin', '运营概览'],
+          ['/admin/review', '物品审核'],
+          ['/admin/reports', '工单处理'],
+          ['/admin/dicts', '业务字典'],
+          ['/admin/logs', '操作日志'],
+        ]"
+        :to="url"
+        :key="url"
+        class="side-link"
+        exact-active-class="active"
+      >
+        {{ label }}
+      </RouterLink>
+    </section>
+    <section>
+      <small>社团与活动</small>
+      <RouterLink class="side-link" to="/club" active-class="active">捐赠台账</RouterLink>
+      <RouterLink class="side-link" to="/market">主题活动</RouterLink>
+      <RouterLink class="side-link" to="/profile">账户设置</RouterLink>
     </section>
   </aside>
 </template>

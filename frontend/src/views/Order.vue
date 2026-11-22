@@ -1,208 +1,163 @@
 <script setup>
-import { computed } from 'vue'
-import { useRouter } from 'vue-router'
-import { itemById, sample } from '../data'
-import { confirmAction, info, notify } from '../feedback'
-const order = computed(() => sample.order),
-  router = useRouter()
-const parties = computed(() => [
-  ['张', 96, '发起方 · 计算机学院', itemById(order.value.offerId)],
-  ['李', 88, '接收方 · 数学学院', itemById(order.value.targetId)],
-])
-const rules = '请在预约时间前后 30 分钟内到场，扫码核销即视为交付完成。无正当理由爽约将扣 10 分信用分。'
-function cancel() {
-  confirmAction('取消交换', '确认取消本次演示交换？', () => {
-    order.value.canceled = true
-    notify('本次交换已取消')
+import { ref, watch } from 'vue'
+import { get, post, file, useLoad, useAction, user, pageOf, orderStates } from '../api'
+import { useRoute } from 'vue-router'
+import LoadState from '../components/LoadState.vue'
+import { notify } from '../feedback'
+import Pager from '../components/Pager.vue'
+import { onUnmounted } from 'vue'
+const id = useRoute().params.id,
+  page = ref(1),
+  roleType = ref('from'),
+  orderStatus = ref('')
+watch([roleType, orderStatus], () => (page.value = 1))
+const state = useLoad(
+  () =>
+    id
+      ? get('/orders/' + id)
+      : get('/orders/mine', {
+          roleType: roleType.value,
+          orderStatus: orderStatus.value,
+          page: page.value,
+          pageSize: 12,
+        }),
+  [page, roleType, orderStatus],
+)
+const { busy, issue, run } = useAction(),
+  reason = ref(''),
+  code = ref(''),
+  score = ref(5),
+  content = ref(''),
+  tags = ref(''),
+  submitted = ref(false),
+  qr = ref('')
+onUnmounted(() => URL.revokeObjectURL(qr.value))
+function act(op, body) {
+  run(async () => {
+    await post('/orders/' + id + '/' + op, body)
+    await state.reload()
+    notify('流转单已更新')
+  })
+}
+function showCode() {
+  run(async () => {
+    const blob = await file('/orders/' + id + '/qrcode')
+    URL.revokeObjectURL(qr.value)
+    qr.value = URL.createObjectURL(blob)
+  })
+}
+function review() {
+  run(async () => {
+    await post('/reviews', {
+      orderId: Number(id),
+      score: Number(score.value),
+      content: content.value,
+      tags: tags.value,
+    })
+    submitted.value = true
+    notify('评价已提交')
+    await state.reload()
   })
 }
 </script>
 <template>
-  <main class="wrap">
-    <div class="heading">
-      <div>
-        <div class="inline">
-          <h1>流转单</h1>
-          <span class="tag gold">{{
-            order.canceled ? '已取消' : order.appointment ? '已预约 · 待面交' : '已确认 · 待预约面交'
-          }}</span>
-        </div>
-        <p class="subtitle">单号 20261026000123 · 创建于 2026-10-26 14:32</p>
-      </div>
-      <button @click="info('面交流转协议', rules)">查看协议</button>
+  <main class="wrap live">
+    <header class="page-title">
+      <h1>{{ id ? '流转单详情' : '我的流转' }}</h1>
+    </header>
+    <div class="toolbar" v-if="!id">
+      <label class="field">
+        <span>我的身份</span>
+        <select v-model="roleType">
+          <option value="from">我发起的</option>
+          <option value="to">我收到的</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>当前状态</span>
+        <select v-model="orderStatus">
+          <option value="">全部</option>
+          <option v-for="(s, i) in orderStates" :value="i">{{ s }}</option>
+        </select>
+      </label>
     </div>
-    <div class="panel steps">
-      <div
-        v-for="(s, i) in ['已提交', '已确认', '待面交', '已完成']"
-        :class="{ done: i <= (order.appointment ? 2 : 1) }"
-      >
-        <span>{{ i === 0 ? '✓' : i + 1 }}</span
-        >{{ s }}
-      </div>
-    </div>
-    <div class="columns">
-      <div class="stack">
-        <section class="panel">
-          <h3>交换双方</h3>
-          <div class="parties">
-            <template v-for="([n, credit, role, item], i) in parties"
-              ><b v-if="i" class="positive">⇄</b>
-              <div class="panel party">
-                <div class="inline">
-                  <span class="avatar">{{ n }}</span>
-                  <div>
-                    <b>{{ n }}同学</b> <span class="tag mint">信用 {{ credit }}</span>
-                    <div class="small">{{ role }}</div>
-                  </div>
-                </div>
-                <hr />
-                <div class="inline">
-                  <span class="tile mini" :class="item.color">{{ item.label }}</span>
-                  <div>
-                    <b>{{ item.title }}</b>
-                    <p class="small subtitle">{{ item.condition }} · {{ item.campus }}</p>
-                  </div>
-                </div>
-              </div></template
-            >
-          </div>
-        </section>
-        <section class="panel">
-          <div class="spread">
-            <h3>面交信息</h3>
-            <span class="tag sky">{{ order.appointment ? '已预约' : '未预约' }}</span>
-          </div>
-          <div class="spread meet">
-            <p class="small">
-              {{
-                order.appointment
-                  ? order.appointment.date + ' ' + order.appointment.time + ' · ' + order.appointment.place
-                  : '还没有约定面交时间，请双方尽快预约。'
-              }}<br />预约后系统会生成核销二维码，面交时扫码完成交付。
-            </p>
-            <button class="primary" :disabled="order.canceled" @click="router.push('/appointment')">
-              {{ order.appointment ? '查看预约' : '预约面交' }}
-            </button>
-          </div>
-        </section>
-        <section class="panel">
-          <h3>交换留言</h3>
-          <div class="panel tinted meet">
-            <small>张同学 · 14:32</small>
-            <p>{{ order.message }}</p>
-          </div>
-        </section>
-        <section class="panel spread">
-          <small><b>面交提醒：</b>{{ rules }}</small
-          ><button class="chip" @click="info('流转规则', rules)">查看流转规则</button>
-        </section>
-      </div>
-      <aside class="stack">
-        <section class="panel stack tight">
-          <h3>操作</h3>
-          <button class="primary" :disabled="order.canceled" @click="router.push('/appointment')">
-            预约面交</button
-          ><button @click="info('联系对方', '李同学 · 本部校区。双方可在预约页选择面交时间与地点。')">
-            联系对方</button
-          ><button class="danger" :disabled="order.canceled" @click="cancel">取消交换</button
-          ><small>取消后双方物品将立即解锁回到「在售」。<br />对方 24 小时未响应，系统自动取消。</small>
-        </section>
-        <section class="panel">
-          <h3>流转记录</h3>
-          <ul class="timeline">
-            <li v-if="order.canceled">本次交换已取消</li>
-            <li v-if="order.appointment">
-              已预约面交<small>{{ order.appointment.date }} {{ order.appointment.time }}</small>
-            </li>
-            <li
-              v-for="[s, t] in [
-                ['对方已确认交换', '15:02'],
-                ['你发起了交换意向', '14:32'],
-                ['双方物品锁定', '14:32'],
-              ]"
-            >
-              {{ s }}<small>10-26 {{ t }}</small>
-            </li>
-          </ul>
-        </section>
-      </aside>
-    </div>
+    <LoadState :state="state" v-slot="{ data }">
+      <template v-if="!id">
+        <RouterLink class="ledger-row" v-for="o in data.list" :to="'/order/' + (o.orderId ?? o.id)">
+          <b>{{ o.itemTitle || o.orderNo }}</b>
+          <span>{{ o.orderNo }} · {{ orderStates[o.orderStatus] }} →</span>
+        </RouterLink>
+        <p v-if="!data.list.length" class="empty">暂无流转单</p>
+        <Pager v-if="pageOf(data)?.pages > 1" v-model:page="page" :total="pageOf(data).pages" />
+      </template>
+      <section v-else class="panel editor">
+        <small>{{ data.orderNo }}</small>
+        <h2>{{ data.itemTitle || data.item?.title }} · {{ orderStates[data.orderStatus] }}</h2>
+        <p>{{ [data.appointTime, data.appointPlace, data.closeReason].filter(Boolean).join(' · ') }}</p>
+        <button
+          v-if="data.orderStatus === 0 && data.toUserId === user?.userId"
+          class="primary"
+          :disabled="busy"
+          @click="act('confirm', {})"
+        >
+          确认接单
+        </button>
+        <RouterLink v-if="data.orderStatus === 1" class="btn primary" :to="'/appointment/' + id">
+          预约面交
+        </RouterLink>
+        <form
+          class="toolbar"
+          v-if="[0, 1, 2].includes(data.orderStatus)"
+          @submit.prevent="act('cancel', { closeReason: reason })"
+        >
+          <input
+            v-model.trim="reason"
+            placeholder="取消原因"
+            aria-label="取消原因"
+            required
+            maxlength="255"
+          />
+          <button :disabled="busy">取消流转</button>
+        </form>
+        <template v-if="data.orderStatus === 2">
+          <button v-if="data.toUserId === user?.userId" :disabled="busy" @click="showCode">
+            出示核销二维码
+          </button>
+          <img v-if="qr && data.toUserId === user?.userId" :src="qr" width="200" alt="核销二维码" />
+          <form
+            v-if="data.fromUserId === user?.userId"
+            class="editor"
+            @submit.prevent="act('verify', { verifyCode: code })"
+          >
+            <label>
+              当面验货后输入核销码
+              <input v-model.trim="code" required />
+            </label>
+            <button class="primary" :disabled="busy">确认核销</button>
+          </form>
+        </template>
+        <form
+          v-if="data.orderStatus === 3 && !data.reviewed && !submitted"
+          class="editor"
+          @submit.prevent="review"
+        >
+          <h3>履约评价</h3>
+          <label class="field">
+            <span>评分（1～5）</span>
+            <input v-model="score" type="number" min="1" max="5" required />
+          </label>
+          <label class="field">
+            <span>评价</span>
+            <input v-model="content" maxlength="500" required />
+          </label>
+          <label class="field">
+            <span>标签（逗号分隔）</span>
+            <input v-model="tags" />
+          </label>
+          <button class="primary" :disabled="busy">提交评价</button>
+        </form>
+      </section>
+    </LoadState>
+    <p v-if="issue" role="alert" class="error">{{ issue }}</p>
   </main>
 </template>
-<style scoped>
-.steps {
-  display: flex;
-  margin-bottom: 14px;
-  padding: 16px 24px;
-}
-.steps > div {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: #929aa4;
-  flex: 1;
-}
-.steps > div:last-child {
-  flex: none;
-}
-.steps > div:not(:last-child)::after {
-  content: '';
-  height: 2px;
-  background: #e6e8eb;
-  flex: 1;
-  margin-right: 10px;
-}
-.steps > div.done::after {
-  background: var(--green);
-}
-.steps span {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  background: #f1f3f5;
-  border-radius: 50%;
-  font-weight: bold;
-}
-.steps .done {
-  color: var(--green);
-}
-.steps .done span {
-  background: var(--green);
-  color: white;
-}
-.parties {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 14px;
-  margin-top: 14px;
-}
-.party {
-  padding: 14px;
-}
-.parties > b {
-  font-size: 23px;
-}
-.meet {
-  margin-top: 16px;
-}
-.meet p {
-  line-height: 1.9;
-}
-@media (max-width: 620px) {
-  .parties {
-    grid-template-columns: 1fr;
-  }
-  .parties > b {
-    display: none;
-  }
-  .steps {
-    padding: 10px;
-  }
-  .steps > div {
-    gap: 3px;
-    font-size: 11px;
-  }
-}
-</style>

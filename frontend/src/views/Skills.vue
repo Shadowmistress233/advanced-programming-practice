@@ -1,153 +1,111 @@
 <script setup>
-import { computed, ref, onMounted, reactive } from 'vue'
-import { useRoute } from 'vue-router'
-import { skills, sample } from '../data'
-import { notify } from '../feedback'
-const route = useRoute(),
-  category = ref('全部'),
-  mutual = ref(true),
-  formDialog = ref(),
-  form = reactive({ title: '', want: '', category: '学业辅导' })
-const categories = ['学业辅导', '技能教学', '生活服务', '兴趣陪练']
-const list = computed(() =>
-  [...skills, ...sample.extraSkills].filter(
-    (s) =>
-      (category.value === '全部' || s.category === category.value) &&
-      (!mutual.value || s.complementary !== false),
-  ),
+import { ref, reactive, watch } from 'vue'
+import { get, post, useLoad, useAction, user, pageOf } from '../api'
+import { useRouter } from 'vue-router'
+import LoadState from '../components/LoadState.vue'
+import Pager from '../components/Pager.vue'
+const router = useRouter(),
+  keyword = ref(''),
+  level = ref(''),
+  skillType = ref(''),
+  page = ref(1),
+  show = ref(false)
+watch([keyword, level, skillType], () => (page.value = 1))
+const state = useLoad(
+  () =>
+    get('/skills', {
+      keyword: keyword.value,
+      level: level.value,
+      skillType: skillType.value,
+      page: page.value,
+      pageSize: 12,
+    }),
+  [keyword, level, skillType, page],
 )
-onMounted(() => {
-  if (route.query.publish) formDialog.value.showModal()
+const form = reactive({
+  skillName: '',
+  skillType: 1,
+  level: '熟练',
+  expectSkill: '',
+  description: '',
+  status: 1,
 })
-function publish() {
-  sample.extraSkills.unshift({
-    ...form,
-    id: 100 + sample.extraSkills.length,
-    name: '张',
-    credit: 96,
-    level: '熟练',
-    complementary: false,
+const { busy, issue, run } = useAction()
+function save() {
+  run(async () => {
+    const data = await post('/skills', { ...form, skillType: Number(form.skillType) })
+    router.push('/skill/' + data.skillId)
   })
-  mutual.value = false
-  category.value = '全部'
-  formDialog.value.close()
-  notify('已添加本地技能卡片')
 }
 </script>
 <template>
-  <main class="wrap">
-    <div class="heading">
-      <div>
-        <h1>技能交换</h1>
-        <p class="subtitle">用你会的，换你想学的 · 不涉及金钱</p>
+  <main class="wrap live">
+    <header class="page-title"><h1>技能交换</h1></header>
+    <div class="toolbar">
+      <label class="field">
+        <span>搜索技能</span>
+        <input v-model="keyword" type="search" />
+      </label>
+      <label class="field">
+        <span>技能方向</span>
+        <select v-model="skillType">
+          <option value="1">我能提供</option>
+          <option value="2">我需要</option>
+          <option value="">全部</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>熟练度</span>
+        <select v-model="level">
+          <option value="">全部</option>
+          <option value="入门">入门</option>
+          <option value="熟练">熟练</option>
+          <option value="精通">精通</option>
+        </select>
+      </label>
+      <button v-if="user?.role === 'student'" @click="show = !show">发布技能</button>
+    </div>
+    <form v-if="show" class="editor panel" @submit.prevent="save">
+      <label class="field">
+        <span>技能名称</span>
+        <input v-model="form.skillName" required maxlength="50" />
+      </label>
+      <label class="field">
+        <span>方向</span>
+        <select v-model="form.skillType">
+          <option value="1">我能提供</option>
+          <option value="2">我需要</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>熟练程度</span>
+        <select v-model="form.level">
+          <option value="入门">入门</option>
+          <option value="熟练">熟练</option>
+          <option value="精通">精通</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>希望交换</span>
+        <input v-model="form.expectSkill" required maxlength="100" />
+      </label>
+      <label class="field">
+        <span>服务说明</span>
+        <input v-model="form.description" maxlength="500" />
+      </label>
+      <p v-if="issue" role="alert" class="error">{{ issue }}</p>
+      <button class="primary" :disabled="busy">发布</button>
+    </form>
+    <LoadState :state="state" v-slot="{ data }">
+      <div class="bulletins">
+        <RouterLink v-for="s in data.list" class="panel bulletin" :to="'/skill/' + (s.skillId ?? s.id)">
+          <small>{{ Number(s.skillType) === 1 ? '能提供' : '正在找' }} · {{ s.level }}</small>
+          <h2>{{ s.skillName }}</h2>
+          <p>希望交换 · {{ s.expectSkill }}</p>
+        </RouterLink>
       </div>
-      <button class="primary" @click="formDialog.showModal()">＋ 发布技能</button>
-    </div>
-    <div class="panel spread skill-filters">
-      <div class="actions pills">
-        <button
-          v-for="c in ['全部', ...categories]"
-          class="chip"
-          :class="{ chosen: category === c }"
-          @click="category = c"
-        >
-          {{ c }}
-        </button>
-      </div>
-      <button class="plain small" role="switch" :aria-checked="mutual" @click="mutual = !mutual">
-        仅看与我互补 <span class="switch" :class="{ on: mutual }"></span>
-      </button>
-    </div>
-    <div class="three">
-      <article v-for="(s, i) in list" :key="s.id" class="panel skill-card">
-        <div class="spread">
-          <div class="inline">
-            <span class="avatar gray">{{ s.name }}</span
-            ><span
-              ><b>{{ s.name }}同学</b><small>信用 {{ s.credit }}</small></span
-            >
-          </div>
-          <span class="tag" :class="{ mint: i === 0 }">{{ s.level }}</span>
-        </div>
-        <RouterLink :to="'/skill/' + s.id"
-          ><h2>{{ s.title }}</h2></RouterLink
-        ><small>可提供：每周二、四晚上，本部图书馆</small>
-        <hr />
-        <div class="spread">
-          <div>
-            <small>期望换到</small><b class="positive">{{ s.want }}</b>
-          </div>
-          <RouterLink class="btn chip" :class="i === 0 ? 'primary' : 'soft'" :to="'/skill/' + s.id"
-            >发起邀约</RouterLink
-          >
-        </div>
-      </article>
-    </div>
-    <p v-if="!list.length" class="panel empty">当前分类暂无匹配技能</p>
-    <dialog ref="formDialog">
-      <form class="stack" @submit.prevent="publish">
-        <h2>发布技能</h2>
-        <label class="field"
-          ><span>我能提供</span><input required maxlength="40" v-model.trim="form.title" /></label
-        ><label class="field"><span>期望换到</span><input required v-model.trim="form.want" /></label
-        ><label class="field"
-          ><span>分类</span
-          ><select v-model="form.category">
-            <option v-for="c in categories">{{ c }}</option>
-          </select></label
-        >
-        <div class="actions end">
-          <button type="button" @click="formDialog.close()">取消</button
-          ><button class="primary">确认发布</button>
-        </div>
-      </form>
-    </dialog>
+      <p v-if="!data.list?.length" class="empty">暂无匹配的技能</p>
+      <Pager v-if="pageOf(data)?.pages > 1" v-model:page="page" :total="pageOf(data).pages" />
+    </LoadState>
   </main>
 </template>
-<style scoped>
-.skill-filters {
-  margin-bottom: 16px;
-  padding: 15px 20px;
-  flex-wrap: wrap;
-}
-.switch {
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  background: #c6cdd0;
-  border-radius: 20px;
-  padding: 3px;
-}
-.switch::before {
-  content: '';
-  display: block;
-  width: 14px;
-  height: 14px;
-  background: white;
-  border-radius: 50%;
-}
-.switch.on {
-  background: var(--green);
-}
-.switch.on::before {
-  margin-left: 16px;
-}
-.skill-card {
-  padding: 18px;
-}
-.skill-card small {
-  display: block;
-}
-.skill-card h2 {
-  margin: 14px 0 6px;
-  font-size: 17px;
-}
-.skill-card .btn {
-  padding: 6px 13px;
-  font-weight: 650;
-}
-.skill-card .positive {
-  display: block;
-  margin-top: 3px;
-}
-</style>

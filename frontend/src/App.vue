@@ -18,7 +18,7 @@ watch(dialog, async (value) => {
     <WorkNav />
     <main class="workbody"><RouterView :key="route.path" /></main>
   </div>
-  <template v-else><TopNav v-if="route.path !== '/login'" /><RouterView :key="route.fullPath" /></template>
+  <template v-else><TopNav v-if="route.path !== '/login'" /><RouterView :key="route.path" /></template>
   <dialog ref="popup" @cancel="dialog = null">
     <template v-if="dialog"
       ><h2>{{ dialog.title }}</h2>

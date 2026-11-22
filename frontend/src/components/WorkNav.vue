@@ -1,5 +1,23 @@
 <script setup>
+import {
+  BookMarked,
+  CalendarDays,
+  ClipboardCheck,
+  HeartHandshake,
+  LayoutDashboard,
+  ScrollText,
+  Settings,
+  ShieldAlert,
+} from '@lucide/vue'
 import { user } from '../api'
+
+const adminLinks = [
+  ['/admin', '运营概览', LayoutDashboard],
+  ['/admin/review', '物品审核', ClipboardCheck],
+  ['/admin/reports', '工单处理', ShieldAlert],
+  ['/admin/dicts', '业务字典', BookMarked],
+  ['/admin/logs', '操作日志', ScrollText],
+]
 </script>
 <template>
   <aside class="worknav">
@@ -10,26 +28,30 @@ import { user } from '../api'
     <section v-if="user?.role === 'admin'">
       <small>运营管理</small>
       <RouterLink
-        v-for="[url, label] in [
-          ['/admin', '运营概览'],
-          ['/admin/review', '物品审核'],
-          ['/admin/reports', '工单处理'],
-          ['/admin/dicts', '业务字典'],
-          ['/admin/logs', '操作日志'],
-        ]"
+        v-for="[url, label, Icon] in adminLinks"
         :to="url"
         :key="url"
         class="side-link"
         exact-active-class="active"
       >
-        {{ label }}
+        <component :is="Icon" :size="16" :stroke-width="1.8" />
+        <span>{{ label }}</span>
       </RouterLink>
     </section>
     <section>
       <small>社团与活动</small>
-      <RouterLink class="side-link" to="/club" active-class="active">捐赠台账</RouterLink>
-      <RouterLink class="side-link" to="/market">主题活动</RouterLink>
-      <RouterLink class="side-link" to="/profile">账户设置</RouterLink>
+      <RouterLink class="side-link" to="/club" active-class="active">
+        <HeartHandshake :size="16" :stroke-width="1.8" />
+        <span>捐赠审核台</span>
+      </RouterLink>
+      <RouterLink class="side-link" to="/market">
+        <CalendarDays :size="16" :stroke-width="1.8" />
+        <span>主题活动</span>
+      </RouterLink>
+      <RouterLink class="side-link" to="/profile">
+        <Settings :size="16" :stroke-width="1.8" />
+        <span>账户设置</span>
+      </RouterLink>
     </section>
   </aside>
 </template>

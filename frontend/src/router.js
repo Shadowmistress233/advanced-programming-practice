@@ -42,7 +42,7 @@ export const router = createRouter({
     })),
     { path: '/:pathMatch(.*)*', redirect: '/login' },
   ],
-  scrollBehavior: () => ({ top: 0 }),
+  scrollBehavior: (to, from) => (to.path === from.path ? false : { top: 0 }),
 })
 const publicRoutes = ['登录', '首页', '搜索与筛选', '物品详情', '技能大厅', '换物集市', '捐赠凭证']
 router.beforeEach(async (to) => {
